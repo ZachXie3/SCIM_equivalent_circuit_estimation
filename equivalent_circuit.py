@@ -44,7 +44,15 @@ class MotorCase:
 class EquivalentCircuitEstimator:
     """Steady-state-oriented estimator.
 
-    Logic update:
+    *** KNOWN UNKNOWNS — see per-method comments for details ***
+    - Xm from no-load (§5): returns X_nl = X1_true + Xm_true, not Xm alone.
+      The no-load prediction then double-counts X1, biasing I0 and P0.
+    - R3 from LR torque (§6): disconnected from R2 (dual rotor-resistance model).
+      LR predictions (ILR, TLR) are exact by construction, providing zero constraint.
+    - Xtot from shunt correction (§8): overestimates X1+X2 by (I_mag/I_r)·X1 (~10-25%).
+    - Alpha grid: coarse, uneven (6 values). R2 bounds: hardcoded [1e-6, 0.2].
+
+    Logic (may change once unknowns are resolved):
     - Fix Xtot = X1 + X2 from the full-load-with-shunt-current formula.
     - Fix Xm from no-load test.
     - Compute R3 from LR torque/current relation.
@@ -81,12 +89,23 @@ class EquivalentCircuitEstimator:
         return self.case.R_1 * (tb + K1_COPPER) / (ta + K1_COPPER)
 
     def _estimate_xm_from_no_load(self) -> float:
-        # same practical no-load estimate already shown to align well with IEEE BM result
+        # KNOWN-UNKNOWN: This returns X_nl = X1_true + Xm_true (total no-load
+        # reactance), not Xm alone. In _predict the no-load impedance becomes
+        # R1 + j(X1_guess + X_nl) = R1 + j(X1_guess + X1_true + Xm_true), which
+        # double-counts X1 and underestimates I0. The fix requires iterative
+        # separation: start with Xm = X_nl, solve, then update Xm = X_nl - X1,
+        # re-solve until stable.
         s0 = math.sqrt(3.0) * self.case.V_LL * self.case.I_0
         q0 = math.sqrt(max(s0**2 - self.case.P_0**2, 0.0))
         return 3.0 * self.V_ph**2 / max(q0, EPS)
 
     def _estimate_r3_from_locked_rotor(self) -> float:
+        # KNOWN-UNKNOWN: R3 is the standstill rotor resistance derived from LR torque,
+        # but it is disconnected from R2 (running rotor resistance). No skin-effect
+        # model bridges the two. Because R3 and XLR are back-solved from LR data,
+        # ILR and TLR predictions always exactly match measured values — they provide
+        # zero constraint on the fit. A frequency-dependent rotor resistance model
+        # would unify R3 and R2.
         return self.T_LR_Nm * self.omega_s / max(3.0 * self.case.I_LR**2, EPS)
 
     def _estimate_xlr_from_locked_rotor(self) -> float:
@@ -94,6 +113,22 @@ class EquivalentCircuitEstimator:
         return math.sqrt(max(zlr**2 - (self.R1_hot + self.R3)**2, EPS))
 
     def _estimate_xtot_from_full_load_with_shunt(self) -> float:
+        # KNOWN-UNKNOWN: This method systematically overestimates X1+X2.
+        #
+        # Derivation of the bias:
+        #   Z_sr = V_ph / (I_FL - I_0)
+        #        = (R2/s + jX2) + (1 + I_mag/I_r)*(R1 + jX1)
+        #   Im(Z_sr) = X1 + X2 + (I_mag/I_r)*X1   (10-25% high)
+        #
+        # Two compounding issues:
+        #   1. V_ph is the terminal voltage, not the voltage at the parallel node.
+        #      The actual rotor-path impedance needs V_parallel = V_ph - I_FL*(R1+jX1).
+        #   2. I_0 (no-load phasor) is not the magnetising phasor at full load —
+        #      the voltage drop across R1+jX1 at full load changes both magnitude
+        #      and phase of the magnetising current.
+        #
+        # A correct estimate requires iterative refinement: after solving alpha,
+        # re-compute Xtot from the now-known X1 and Xm.
         pf = max(min(self.case.PF_FL, 1.0), -1.0)
         phi = math.acos(pf)
         I_fl = cmath.rect(self.case.I_FL, -phi)
@@ -116,7 +151,10 @@ class EquivalentCircuitEstimator:
         if X3 <= 0.0:
             return None
 
-        # no-load consistency check (Xm fixed)
+        # KNOWN-UNKNOWN: Z0 = R1_hot + j(X1 + self.Xm) double-counts X1 because
+        # self.Xm is X_nl = X1_true + Xm_true (total no-load reactance), not Xm alone.
+        # Correct would be: first solve, then Xm = X_nl - X1, re-solve.
+        # The I0 and P0 predictions below are therefore under-estimated.
         Z0 = complex(self.R1_hot, X1 + self.Xm)
         I0 = abs(self.V_ph / Z0)
         p_fw = self.case.P_FW if self.case.P_FW is not None else 0.0
@@ -141,6 +179,8 @@ class EquivalentCircuitEstimator:
         Zlr = abs(complex(Rlr, self.XLR))
         ILR = self.V_ph / max(Zlr, EPS)
         TLR = (3.0 / max(self.omega_s, EPS)) * self.V_ph**2 * self.R3 / max(Zlr**2, EPS)
+        # KNOWN-UNKNOWN: Simplified-circuit breakdown formula (neglects Xm path).
+        # Inherits any bias in Xtot from the shunt-correction seed.
         sBDm = R2 / max(math.sqrt(self.R1_hot**2 + self.Xtot**2), EPS)
         Rbd = self.R1_hot + R2 / max(self.case.s_BD, EPS)
         Zbd = abs(complex(Rbd, self.Xtot))
@@ -166,6 +206,9 @@ class EquivalentCircuitEstimator:
         }
 
     def fit(self):
+        # KNOWN-UNKNOWN: The objective includes I0/P0 which are biased by the Xm
+        # double-count in _predict. The optimizer may trade off errors across terms
+        # rather than converge to a physically meaningful solution.
         # Since Xtot and Xm are fixed, solve only R2 for each alpha and choose best alpha.
         tols = {
             'I0': max(0.05 * self.case.I_0, 1e-6),
@@ -177,6 +220,8 @@ class EquivalentCircuitEstimator:
         }
 
         best = None
+        # KNOWN-UNKNOWN: Alpha grid is coarse (6 discrete values) with uneven
+        # spacing. The true X1/X2 split may lie far from any candidate.
         for alpha in [0.30, 0.35, 0.39, 0.40, 0.45, 0.50]:
             def obj_r2(R2: float):
                 pred = self._predict(alpha, R2)
@@ -192,6 +237,8 @@ class EquivalentCircuitEstimator:
                 }
                 return sum(v * v for v in r.values())
 
+            # KNOWN-UNKNOWN: R2 bounds [1e-6, 0.2] hardcoded and motor-size-dependent.
+            # Fallback R2 = 0.05 when SciPy unavailable is arbitrary.
             if _HAS_SCIPY:
                 res = minimize_scalar(obj_r2, bounds=(1e-6, 0.2), method='bounded')
                 R2_best = float(res.x)
