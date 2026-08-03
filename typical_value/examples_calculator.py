@@ -1,11 +1,11 @@
 """
-Equivalent circuit calculator based on EquivalentCircuitParameters Rev.5.xlsx.
+Example-design equivalent circuit calculator based on EquivalentCircuitParameters Rev.5.xlsx.
 
 Usage:
-    python eq_circuit_calculator.py typical_eq_circuit.csv equivalent_circuit_results.csv
+    python examples_calculator.py examples_input.csv examples_eq_results.csv
 
 Optional Excel output:
-    python eq_circuit_calculator.py typical_eq_circuit.csv equivalent_circuit_results.csv --xlsx equivalent_circuit_results.xlsx
+    python examples_calculator.py examples_input.csv examples_eq_results.csv --xlsx examples_eq_results.xlsx
 
 Notes:
 - Jconn = 3 for Delta; otherwise 1.

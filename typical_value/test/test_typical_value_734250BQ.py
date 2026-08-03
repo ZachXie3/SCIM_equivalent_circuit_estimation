@@ -1,8 +1,12 @@
 """Regression test using EquivalentCircuitParameters Rev.5 output for 734250BQ_Rev2."""
 
+import sys
 from math import isclose
+from pathlib import Path
 
-from eq_circuit_calculator import calculate_row
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from examples_calculator import calculate_row
 
 # Inputs are mapped from 734250BQ_Rev2 DesignSheet and the calculated BDT ratio.
 # Important: the Rev.5 workbook's text formula extracts NoLoadAmps as 07.93 from

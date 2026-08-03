@@ -29,8 +29,7 @@ class MotorCase:
     I_LR: float
     T_LR: float   # pu of T_FL
     T_BD: float   # pu of T_FL
-    s_BD: float
-    R_1: float    # raw measured stator phase resistance at ambient
+    R1_cold: float    # raw measured stator phase resistance at ambient
     I_0: float
     P_0: float
     J: float
@@ -45,24 +44,31 @@ class EquivalentCircuitEstimator:
     """Steady-state-oriented estimator.
 
     *** KNOWN UNKNOWNS — see per-method comments for details ***
-    - Xm from no-load (§5): returns X_nl = X1_true + Xm_true, not Xm alone.
-      The no-load prediction then double-counts X1, biasing I0 and P0.
-    - R3 from LR torque (§6): disconnected from R2 (dual rotor-resistance model).
+    - R3 from LR torque: disconnected from R2 (dual rotor-resistance model).
       LR predictions (ILR, TLR) are exact by construction, providing zero constraint.
-    - Xtot from shunt correction (§8): overestimates X1+X2 by (I_mag/I_r)·X1 (~10-25%).
+      A skin-effect bridge R2 <-> R3 is proposed (TBD).
+    - Xtot from shunt correction: overestimates X1+X2 by (I_mag/I_r)·X1 (~10-25%).
     - Alpha grid: coarse, uneven (6 values). R2 bounds: hardcoded [1e-6, 0.2].
 
     Logic (may change once unknowns are resolved):
+    - Fix X0 (total no-load reactance) from the no-load test.
     - Fix Xtot = X1 + X2 from the full-load-with-shunt-current formula.
-    - Fix Xm from no-load test.
     - Compute R3 from LR torque/current relation.
-    - Use XLR from LR current relation.
+    - Use XLR from LR current relation (with R1_cold + R3).
+    - Inside _predict: X1 = alpha·Xtot, Xm = X0 - X1 (no X1 double-count).
     - Iterate alpha only (outer scan), while solving R2 for each alpha.
     """
 
     def __init__(self, case: MotorCase):
         self.case = case
         self.V_ph = self._per_phase_voltage()
+        # Convert nameplate/test line currents to per-phase currents so that the
+        # per-phase circuit predictions are compared on a consistent basis:
+        #   I_ph = I_line        (Y / Wye)
+        #   I_ph = I_line / √3   (Δ / Delta)
+        self.I_FL_ph = self._line_to_phase_current(case.I_FL)
+        self.I_LR_ph = self._line_to_phase_current(case.I_LR)
+        self.I_0_ph = self._line_to_phase_current(case.I_0)
         self.n_s = 120.0 * case.f / case.P
         self.omega_s = 2.0 * math.pi * self.n_s / 60.0
         self.s_FL = (self.n_s - case.n_FL) / self.n_s
@@ -70,32 +76,45 @@ class EquivalentCircuitEstimator:
         self.T_FL = case.P_out * HP_TO_WATT / max(2.0 * math.pi * case.n_FL / 60.0, EPS)
         self.T_LR_Nm = case.T_LR * self.T_FL
         self.T_BD_Nm = case.T_BD * self.T_FL
-        self.Xm = self._estimate_xm_from_no_load()
+        self.X0 = self._estimate_x0_from_no_load()
         self.R3 = self._estimate_r3_from_locked_rotor()
         self.XLR = self._estimate_xlr_from_locked_rotor()
         self.Xtot = self._estimate_xtot_from_full_load_with_shunt()
 
-    def _per_phase_voltage(self) -> float:
-        c = self.case.connection.upper().strip()
-        if c == 'Y':
-            return self.case.V_LL / math.sqrt(3.0)
+    @property
+    def _is_delta(self) -> bool:
+        c = self.case.connection.strip().upper()
+        if c in {'Y', 'WYE'}:
+            return False
         if c in {'D', 'DELTA', 'Δ'}:
-            return self.case.V_LL
+            return True
         raise ValueError(f'Unsupported connection: {self.case.connection!r}')
+
+    def _per_phase_voltage(self) -> float:
+        # V_LL -> V_ph: V_LL/√3 (Y), V_LL (Δ). Applies at every operating point
+        # (full-load, locked-rotor, no-load) since the rated voltage is the same.
+        if self._is_delta:
+            return self.case.V_LL
+        return self.case.V_LL / math.sqrt(3.0)
+
+    def _line_to_phase_current(self, i_line: float) -> float:
+        return i_line / math.sqrt(3.0) if self._is_delta else i_line
 
     def _correct_r1_to_hot(self) -> float:
         ta = self.case.T_ambient_C
         tb = ta + self.case.temp_rise_C
-        return self.case.R_1 * (tb + K1_COPPER) / (ta + K1_COPPER)
+        return self.case.R1_cold * (tb + K1_COPPER) / (ta + K1_COPPER)
 
-    def _estimate_xm_from_no_load(self) -> float:
-        # KNOWN-UNKNOWN: This returns X_nl = X1_true + Xm_true (total no-load
-        # reactance), not Xm alone. In _predict the no-load impedance becomes
-        # R1 + j(X1_guess + X_nl) = R1 + j(X1_guess + X1_true + Xm_true), which
-        # double-counts X1 and underestimates I0. The fix requires iterative
-        # separation: start with Xm = X_nl, solve, then update Xm = X_nl - X1,
-        # re-solve until stable.
-        s0 = math.sqrt(3.0) * self.case.V_LL * self.case.I_0
+    def _estimate_x0_from_no_load(self) -> float:
+        # Total no-load reactance X0 = X1_true + Xm_true. This is NOT the
+        # magnetising reactance Xm alone. The true magnetising reactance is
+        #   Xm = X0 - X1   (X1 = alpha * Xtot, fixed in a later step),
+        # so the no-load impedance Z0 = R1 + j(X1 + Xm) simplifies to R1 + j X0
+        # and X1 is NOT double-counted.
+        # No-load per-phase reactance from 3-phase no-load data. S0 computed from
+        # per-phase quantities (3·V_ph·I_0_ph ≡ √3·V_LL·I_0 for both connections),
+        # so 3·V_ph²/Q0 yields X0 = V_ph/I_m_phase consistently for Y and Δ.
+        s0 = 3.0 * self.V_ph * self.I_0_ph
         q0 = math.sqrt(max(s0**2 - self.case.P_0**2, 0.0))
         return 3.0 * self.V_ph**2 / max(q0, EPS)
 
@@ -106,11 +125,14 @@ class EquivalentCircuitEstimator:
         # ILR and TLR predictions always exactly match measured values — they provide
         # zero constraint on the fit. A frequency-dependent rotor resistance model
         # would unify R3 and R2.
-        return self.T_LR_Nm * self.omega_s / max(3.0 * self.case.I_LR**2, EPS)
+        return self.T_LR_Nm * self.omega_s / max(3.0 * self.I_LR_ph**2, EPS)
 
     def _estimate_xlr_from_locked_rotor(self) -> float:
-        zlr = self.V_ph / max(self.case.I_LR, EPS)
-        return math.sqrt(max(zlr**2 - (self.R1_hot + self.R3)**2, EPS))
+        # R_LR = R1_cold + R3: the locked-rotor test is at ambient, so use
+        # the raw stator resistance R1_cold, not the hot value.
+        rlr = self.case.R1_cold + self.R3
+        zlr = self.V_ph / max(self.I_LR_ph, EPS)
+        return math.sqrt(max(zlr**2 - rlr**2, EPS))
 
     def _estimate_xtot_from_full_load_with_shunt(self) -> float:
         # KNOWN-UNKNOWN: This method systematically overestimates X1+X2.
@@ -131,9 +153,9 @@ class EquivalentCircuitEstimator:
         # re-compute Xtot from the now-known X1 and Xm.
         pf = max(min(self.case.PF_FL, 1.0), -1.0)
         phi = math.acos(pf)
-        I_fl = cmath.rect(self.case.I_FL, -phi)
+        I_fl = cmath.rect(self.I_FL_ph, -phi)
         I_w = self.case.P_0 / max(3.0 * self.V_ph, EPS)
-        I_m = math.sqrt(max(self.case.I_0**2 - I_w**2, 0.0))
+        I_m = math.sqrt(max(self.I_0_ph**2 - I_w**2, 0.0))
         I_sh = complex(I_w, -I_m)
         I_sr = I_fl - I_sh
         Z_sr = self.V_ph / I_sr
@@ -151,24 +173,28 @@ class EquivalentCircuitEstimator:
         if X3 <= 0.0:
             return None
 
-        # KNOWN-UNKNOWN: Z0 = R1_hot + j(X1 + self.Xm) double-counts X1 because
-        # self.Xm is X_nl = X1_true + Xm_true (total no-load reactance), not Xm alone.
-        # Correct would be: first solve, then Xm = X_nl - X1, re-solve.
-        # The I0 and P0 predictions below are therefore under-estimated.
-        Z0 = complex(self.R1_hot, X1 + self.Xm)
+        # True magnetising reactance: Xm = X0 - X1 (X0 is the total no-load
+        # reactance, X1 = alpha * Xtot is fixed in this step). This removes the
+        # former X1 double-count: Z0 = R1 + j(X1 + Xm) = R1 + j X0.
+        Xm = self.X0 - X1
+        if Xm <= 0.0:
+            return None
+
+        Z0 = complex(self.R1_hot, X1 + Xm)
         I0 = abs(self.V_ph / Z0)
         p_fw = self.case.P_FW if self.case.P_FW is not None else 0.0
-        p_core = self.case.P_core if self.case.P_core is not None else max(self.case.P_0 - 3.0 * self.case.I_0**2 * self.R1_hot - p_fw, EPS)
+        p_core = self.case.P_core if self.case.P_core is not None else max(self.case.P_0 - 3.0 * self.I_0_ph**2 * self.R1_hot - p_fw, EPS)
         P0 = 3.0 * I0**2 * self.R1_hot + p_core + p_fw
 
         # full-load with shunt branch included
-        Zm = complex(0.0, self.Xm)
+        Zm = complex(0.0, Xm)
         Zr = complex(R2 / max(self.s_FL, EPS), X2)
         Zpar = self._zpar(Zm, Zr)
         Zin = complex(self.R1_hot, X1) + Zpar
         IFL = abs(self.V_ph / Zin)
         PF = max(min(Zin.real / abs(Zin), 1.0), 0.0)
-        Pin = math.sqrt(3.0) * self.case.V_LL * IFL * PF
+        # 3-phase input power from per-phase quantities (valid for Y and Δ).
+        Pin = 3.0 * self.V_ph * IFL * PF
         ETA = self.case.P_out * HP_TO_WATT / max(Pin, EPS)
         Vnode = self.V_ph * (Zpar / Zin)
         Ir = abs(Vnode / Zr)
@@ -179,19 +205,16 @@ class EquivalentCircuitEstimator:
         Zlr = abs(complex(Rlr, self.XLR))
         ILR = self.V_ph / max(Zlr, EPS)
         TLR = (3.0 / max(self.omega_s, EPS)) * self.V_ph**2 * self.R3 / max(Zlr**2, EPS)
-        # KNOWN-UNKNOWN: Simplified-circuit breakdown formula (neglects Xm path).
+        # KNOWN-UNKNOWN: Simplified-circuit breakdown-slip prediction (neglects Xm path).
         # Inherits any bias in Xtot from the shunt-correction seed.
         sBDm = R2 / max(math.sqrt(self.R1_hot**2 + self.Xtot**2), EPS)
-        Rbd = self.R1_hot + R2 / max(self.case.s_BD, EPS)
-        Zbd = abs(complex(Rbd, self.Xtot))
-        TBD = (3.0 / max(self.omega_s, EPS)) * self.V_ph**2 * (R2 / max(self.case.s_BD, EPS)) / max(Zbd**2, EPS)
 
         return {
             'R2': R2,
             'X1': X1,
             'X2': X2,
             'X3': X3,
-            'Xm': self.Xm,
+            'Xm': Xm,
             'R3': self.R3,
             'I0': I0,
             'P0': P0,
@@ -202,19 +225,18 @@ class EquivalentCircuitEstimator:
             'ILR': ILR,
             'TLR': TLR,
             'sBD': sBDm,
-            'TBD': TBD,
         }
 
     def fit(self):
-        # KNOWN-UNKNOWN: The objective includes I0/P0 which are biased by the Xm
-        # double-count in _predict. The optimizer may trade off errors across terms
-        # rather than converge to a physically meaningful solution.
-        # Since Xtot and Xm are fixed, solve only R2 for each alpha and choose best alpha.
+        # KNOWN-UNKNOWN: The objective mixes six error terms; the minimiser may
+        # trade off errors rather than converge to a physically meaningful solution.
+        # Since Xtot and X0 are fixed, solve only R2 for each alpha and choose best alpha.
+        # (Xm = X0 - X1 is resolved inside _predict for each alpha.)
         tols = {
-            'I0': max(0.05 * self.case.I_0, 1e-6),
+            'I0': max(0.05 * self.I_0_ph, 1e-6),
             'P0': max(0.05 * self.case.P_0, 1e-6),
             'TFL': max(0.05 * self.T_FL, 1e-6),
-            'IFL': max(0.03 * self.case.I_FL, 1e-6),
+            'IFL': max(0.03 * self.I_FL_ph, 1e-6),
             'PFFL': max(0.01 * self.case.PF_FL, 1e-6),
             'ETAFL': max(0.01 * self.case.eta_FL, 1e-6),
         }
@@ -228,10 +250,10 @@ class EquivalentCircuitEstimator:
                 if pred is None:
                     return 1e12
                 r = {
-                    'I0': (pred['I0'] - self.case.I_0) / tols['I0'],
+                    'I0': (pred['I0'] - self.I_0_ph) / tols['I0'],
                     'P0': (pred['P0'] - self.case.P_0) / tols['P0'],
                     'TFL': (pred['TFL'] - self.T_FL) / tols['TFL'],
-                    'IFL': (pred['IFL'] - self.case.I_FL) / tols['IFL'],
+                    'IFL': (pred['IFL'] - self.I_FL_ph) / tols['IFL'],
                     'PFFL': (pred['PF'] - self.case.PF_FL) / tols['PFFL'],
                     'ETAFL': (pred['ETA'] - self.case.eta_FL) / tols['ETAFL'],
                 }
@@ -252,7 +274,7 @@ class EquivalentCircuitEstimator:
                 best = {'alpha_best': alpha, 'score': score, **pred}
 
         best['R1_hot'] = self.R1_hot
-        best['R1_raw'] = self.case.R_1
+        best['R1_cold'] = self.case.R1_cold
         best['X1_plus_X2'] = self.Xtot
         best['Xsum_seed_from_shunt'] = self._seed_meta['Z_sr'].imag
         best['Xsum_seed_realpart'] = self._seed_meta['Z_sr'].real
