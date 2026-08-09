@@ -173,9 +173,10 @@ def calculate_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def main() -> None:
+    SCRIPT_DIR = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description="Calculate equivalent circuit parameters for each CSV row.")
-    parser.add_argument("eq_raw", nargs="?", default="eq_raw.csv", help="Input CSV path (default: eq_raw.csv)")
-    parser.add_argument("eq_parameters", nargs="?", default="eq_parameters.csv", help="Output CSV path (default: eq_parameters.csv)")
+    parser.add_argument("eq_raw", nargs="?", default=SCRIPT_DIR/"eq_raw.csv", help="Input CSV path (default: eq_raw.csv)")
+    parser.add_argument("eq_parameters", nargs="?", default=SCRIPT_DIR/"eq_parameters.csv", help="Output CSV path (default: eq_parameters.csv)")
     parser.add_argument("--xlsx", help="Optional Excel output path", default=None)
     args = parser.parse_args()
 
