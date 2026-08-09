@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from examples_calculator import calculate_row
+from typical_value.eq_calculator import calculate_row
 
 # Inputs are mapped from 734250BQ_Rev2 DesignSheet and the calculated BDT ratio.
 # Important: the Rev.5 workbook's text formula extracts NoLoadAmps as 07.93 from

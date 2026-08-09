@@ -4,16 +4,23 @@ import cmath
 import math
 from dataclasses import dataclass
 
+import numpy as np
+
 try:
-    from scipy.optimize import minimize_scalar
+    from scipy.optimize import least_squares
     _HAS_SCIPY = True
-except Exception:
-    minimize_scalar = None
+except Exception:  # pragma: no cover - scipy expected in the target env
+    least_squares = None
     _HAS_SCIPY = False
 
 EPS = 1e-12
 K1_COPPER = 234.5
 HP_TO_WATT = 745.6998715822701
+
+# Outer-iteration defaults (plan.md §4.2)
+TOL_ABS = 1e-6   # ohm
+TOL_REL = 1e-5
+MAX_OUTER_ITER = 50
 
 
 @dataclass
@@ -29,7 +36,7 @@ class MotorCase:
     I_LR: float
     T_LR: float   # pu of T_FL
     T_BD: float   # pu of T_FL
-    R1_cold: float    # raw measured stator phase resistance at ambient
+    R1_cold: float
     I_0: float
     P_0: float
     J: float
@@ -40,46 +47,126 @@ class MotorCase:
     temp_rise_C: float = 80.0
 
 
+# ---------------------------------------------------------------------------
+# Standalone R2-from-R3 model (plan.md Stage 2.4 / 2.5)
+#
+# Deliberately isolated so the empirical rotor-resistance relationship can be
+# replaced in the future without touching the solver: update R2R3_MODEL_D
+# and/or R2R3_MODEL_FALLBACK and the call sites keep working.
+# ---------------------------------------------------------------------------
+
+R2R3_MODEL_D = {
+    # pole_count: {"a": slip exponent, "c": HP exponent, "b": intercept}
+    2: {"a": 0.744, "c": -0.050, "b": 2.464},
+    4: {"a": 0.634, "c": -0.129, "b": 2.277},
+    6: {"a": 0.466, "c": -0.154, "b": 1.629},
+    8: {"a": 0.452, "c": -0.123, "b": 1.393},
+}
+
+# Global Model B fallback for unseen pole counts (HP term dropped, c = 0).
+R2R3_MODEL_FALLBACK = {"a": 0.9239, "b": 3.0090}
+
+# Fitted envelope of the 4180-row training dataset (r2r3_report.md §3/§5).
+DATASET_SLIP_RANGE = (0.0014, 0.1834)
+DATASET_HP_RANGE = (0.4, 4600.0)
+
+
+def estimate_r2_from_r3(
+    R3: float,
+    s_fl: float,
+    pole_count: int,
+    horsepower: float,
+    model: dict[int, dict] | None = None,
+    fallback: dict[str, float] | None = None,
+) -> dict:
+    """Estimate running rotor resistance R2 from standstill R3 (plan §2).
+
+    Model power law, per pole count::
+
+        R2/R3 = exp(b) * s_fl^a * HP^c
+
+    Unseen pole counts fall back to the global model B (c = 0). The result
+    respects the physical bound ``0 < R2 <= R3`` (plan §2.3); a violation is
+    clamped and reported via ``clamped`` so the caller can flag it.
+
+    Returns a dict with keys ``r2``, ``ratio``, ``pole_match``,
+    ``out_of_range``, ``clamped``.
+    """
+    mdl = model if model is not None else R2R3_MODEL_D
+    fb = fallback if fallback is not None else R2R3_MODEL_FALLBACK
+
+    coef = mdl.get(int(pole_count))
+    pole_match = coef is not None
+    a = coef["a"] if pole_match else fb["a"]
+    b = coef["b"] if pole_match else fb["b"]
+    c = coef["c"] if pole_match else 0.0
+
+    out_of_range = not (
+        DATASET_SLIP_RANGE[0] <= s_fl <= DATASET_SLIP_RANGE[1]
+        and DATASET_HP_RANGE[0] <= horsepower <= DATASET_HP_RANGE[1]
+    )
+
+    if min(s_fl, horsepower) <= 0.0:
+        ratio = 0.0
+    else:
+        ratio = math.exp(b + a * math.log(s_fl) + c * math.log(horsepower))
+
+    r2_raw = R3 * ratio
+    clamped = bool(R3 > 0.0 and r2_raw >= R3)
+    r2 = min(max(r2_raw, 0.0), R3) if R3 > 0.0 else 0.0
+    return {
+        "r2": r2,
+        "ratio": float(ratio),
+        "pole_match": bool(pole_match),
+        "out_of_range": bool(out_of_range),
+        "clamped": bool(clamped),
+    }
+
+
 class EquivalentCircuitEstimator:
-    """Steady-state-oriented estimator.
+    """Steady-state-oriented estimator (plan.md Stages 3 and 4).
 
-    *** KNOWN UNKNOWNS — see per-method comments for details ***
-    - R3 from LR torque: disconnected from R2 (dual rotor-resistance model).
-      LR predictions (ILR, TLR) are exact by construction, providing zero constraint.
-      A skin-effect bridge R2 <-> R3 is proposed (TBD).
-    - Xtot from shunt correction: overestimates X1+X2 by (I_mag/I_r)·X1 (~10-25%).
-    - Alpha grid: coarse, uneven (6 values). R2 bounds: hardcoded [1e-6, 0.2].
+    Pipeline (plan.md §4.1):
+      1. line/phase conversion                        (per-phase V and I)
+      2. n_s, omega_s, s_FL, T_FL
+      3. R1_hot from R1_cold                         (temperature corrected)
+      4. R3 from locked-rotor torque                  (standstill rotor R)
+      5. X_LR from locked-rotor current               (R1_cold + R3 path)
+      6. X_0 from no-load current and power           (total no-load reactance)
+      7-14. outer iteration:
+         R2 = estimate_r2_from_r3(...)                (stage 2 dataset model)
+         -> solve (X1, X2) from the full-load current
+            phasor + torque equations (stage 3)
+         -> Xm = X0 - X1, X3 = X_LR - X1
+         until X1 and Xm converge (tol_abs / tol_rel / max_outer)
 
-    Logic (may change once unknowns are resolved):
-    - Fix X0 (total no-load reactance) from the no-load test.
-    - Fix Xtot = X1 + X2 from the full-load-with-shunt-current formula.
-    - Compute R3 from LR torque/current relation.
-    - Use XLR from LR current relation (with R1_cold + R3).
-    - Inside _predict: X1 = alpha·Xtot, Xm = X0 - X1 (no X1 double-count).
-    - Iterate alpha only (outer scan), while solving R2 for each alpha.
+    The old alpha grid and the shunt-correction Xtot seed are removed per the
+    implementation plan (plan.md "Required removals").
     """
 
     def __init__(self, case: MotorCase):
         self.case = case
         self.V_ph = self._per_phase_voltage()
-        # Convert nameplate/test line currents to per-phase currents so that the
-        # per-phase circuit predictions are compared on a consistent basis:
-        #   I_ph = I_line        (Y / Wye)
-        #   I_ph = I_line / √3   (Δ / Delta)
+        # Per-phase currents: I_ph = I_line (Y), I_ph = I_line/√3 (Δ).
         self.I_FL_ph = self._line_to_phase_current(case.I_FL)
         self.I_LR_ph = self._line_to_phase_current(case.I_LR)
         self.I_0_ph = self._line_to_phase_current(case.I_0)
         self.n_s = 120.0 * case.f / case.P
         self.omega_s = 2.0 * math.pi * self.n_s / 60.0
         self.s_FL = (self.n_s - case.n_FL) / self.n_s
-        self.R1_hot = self._correct_r1_to_hot()
         self.T_FL = case.P_out * HP_TO_WATT / max(2.0 * math.pi * case.n_FL / 60.0, EPS)
-        self.T_LR_Nm = case.T_LR * self.T_FL
-        self.T_BD_Nm = case.T_BD * self.T_FL
-        self.X0 = self._estimate_x0_from_no_load()
+        self.T_LR_N = case.T_LR * self.T_FL
+        self.T_BD_N = case.T_BD * self.T_FL
+
+        self.R1_hot = self._correct_r1_to_hot()
         self.R3 = self._estimate_r3_from_locked_rotor()
+        self._lr_impedance_invalid = False
         self.XLR = self._estimate_xlr_from_locked_rotor()
-        self.Xtot = self._estimate_xtot_from_full_load_with_shunt()
+        self.X0 = self._estimate_x0_from_no_load()
+
+        # Full-load current phasor (plan §3.1): lagging, imag negative.
+        phi = math.acos(max(min(case.PF_FL, 1.0), -1.0))
+        self.I_FL_vec = cmath.rect(self.I_FL_ph, -phi)
 
     @property
     def _is_delta(self) -> bool:
@@ -91,8 +178,7 @@ class EquivalentCircuitEstimator:
         raise ValueError(f'Unsupported connection: {self.case.connection!r}')
 
     def _per_phase_voltage(self) -> float:
-        # V_LL -> V_ph: V_LL/√3 (Y), V_LL (Δ). Applies at every operating point
-        # (full-load, locked-rotor, no-load) since the rated voltage is the same.
+        # V_LL -> V_ph: V_LL/√3 (Y), V_LL (Δ).
         if self._is_delta:
             return self.case.V_LL
         return self.case.V_LL / math.sqrt(3.0)
@@ -106,179 +192,228 @@ class EquivalentCircuitEstimator:
         return self.case.R1_cold * (tb + K1_COPPER) / (ta + K1_COPPER)
 
     def _estimate_x0_from_no_load(self) -> float:
-        # Total no-load reactance X0 = X1_true + Xm_true. This is NOT the
-        # magnetising reactance Xm alone. The true magnetising reactance is
-        #   Xm = X0 - X1   (X1 = alpha * Xtot, fixed in a later step),
-        # so the no-load impedance Z0 = R1 + j(X1 + Xm) simplifies to R1 + j X0
-        # and X1 is NOT double-counted.
-        # No-load per-phase reactance from 3-phase no-load data. S0 computed from
-        # per-phase quantities (3·V_ph·I_0_ph ≡ √3·V_LL·I_0 for both connections),
-        # so 3·V_ph²/Q0 yields X0 = V_ph/I_m_phase consistently for Y and Δ.
+        # Total no-load reactance X0 = X1_true + Xm_true (not Xm alone).
+        # S0 computed from per-phase quantities (3*V_ph*I_0_ph is identical
+        # to √3*V_LL*I_0 for both connections).
         s0 = 3.0 * self.V_ph * self.I_0_ph
-        q0 = math.sqrt(max(s0**2 - self.case.P_0**2, 0.0))
-        return 3.0 * self.V_ph**2 / max(q0, EPS)
+        q0 = math.sqrt(max(s0 ** 2 - self.case.P_0 ** 2, 0.0))
+        return 3.0 * self.V_ph ** 2 / max(q0, EPS)
 
     def _estimate_r3_from_locked_rotor(self) -> float:
-        # KNOWN-UNKNOWN: R3 is the standstill rotor resistance derived from LR torque,
-        # but it is disconnected from R2 (running rotor resistance). No skin-effect
-        # model bridges the two. Because R3 and XLR are back-solved from LR data,
-        # ILR and TLR predictions always exactly match measured values — they provide
-        # zero constraint on the fit. A frequency-dependent rotor resistance model
-        # would unify R3 and R2.
-        return self.T_LR_Nm * self.omega_s / max(3.0 * self.I_LR_ph**2, EPS)
+        # R3 (plan §4.1 step 4) is the standstill rotor resistance back-solved
+        # from the locked-rotor torque relation. R3 and X_LR are back-solved
+        # from LR data, so predicted ILR/TLR always match the measurements;
+        # the dataset model bridges R2 <-> R3.
+        return self.T_LR_N * self.omega_s / max(3.0 * self.I_LR_ph ** 2, EPS)
 
     def _estimate_xlr_from_locked_rotor(self) -> float:
-        # R_LR = R1_cold + R3: the locked-rotor test is at ambient, so use
-        # the raw stator resistance R1_cold, not the hot value.
-        rlr = self.case.R1_cold + self.R3
-        zlr = self.V_ph / max(self.I_LR_ph, EPS)
-        return math.sqrt(max(zlr**2 - rlr**2, EPS))
-
-    def _estimate_xtot_from_full_load_with_shunt(self) -> float:
-        # KNOWN-UNKNOWN: This method systematically overestimates X1+X2.
-        #
-        # Derivation of the bias:
-        #   Z_sr = V_ph / (I_FL - I_0)
-        #        = (R2/s + jX2) + (1 + I_mag/I_r)*(R1 + jX1)
-        #   Im(Z_sr) = X1 + X2 + (I_mag/I_r)*X1   (10-25% high)
-        #
-        # Two compounding issues:
-        #   1. V_ph is the terminal voltage, not the voltage at the parallel node.
-        #      The actual rotor-path impedance needs V_parallel = V_ph - I_FL*(R1+jX1).
-        #   2. I_0 (no-load phasor) is not the magnetising phasor at full load —
-        #      the voltage drop across R1+jX1 at full load changes both magnitude
-        #      and phase of the magnetising current.
-        #
-        # A correct estimate requires iterative refinement: after solving alpha,
-        # re-compute Xtot from the now-known X1 and Xm.
-        pf = max(min(self.case.PF_FL, 1.0), -1.0)
-        phi = math.acos(pf)
-        I_fl = cmath.rect(self.I_FL_ph, -phi)
-        I_w = self.case.P_0 / max(3.0 * self.V_ph, EPS)
-        I_m = math.sqrt(max(self.I_0_ph**2 - I_w**2, 0.0))
-        I_sh = complex(I_w, -I_m)
-        I_sr = I_fl - I_sh
-        Z_sr = self.V_ph / I_sr
-        self._seed_meta = {'I_fl': I_fl, 'I_sh': I_sh, 'I_sr': I_sr, 'Z_sr': Z_sr}
-        return max(Z_sr.imag, 1e-6)
+        # X_LR (phase) from the locked-rotor test (plan §4.1 step 5).
+        # The LR test is run cold, so R1_cold (not R1_hot) is used.
+        r_lr = self.case.R1_cold + self.R3
+        z_lr = self.V_ph / max(self.I_LR_ph, EPS)
+        z_sq = z_lr ** 2 - r_lr ** 2
+        if z_sq <= 0.0:
+            self._lr_impedance_invalid = True
+            return EPS
+        self._lr_impedance_invalid = False
+        return math.sqrt(z_sq)
 
     @staticmethod
     def _zpar(z1: complex, z2: complex) -> complex:
         return 1.0 / (1.0 / z1 + 1.0 / z2)
 
-    def _predict(self, alpha: float, R2: float):
-        X1 = alpha * self.Xtot
-        X2 = (1.0 - alpha) * self.Xtot
-        X3 = self.XLR - X1
-        if X3 <= 0.0:
-            return None
+    # -- Stage 3: (X1, X2) interior solve ---------------------------------
 
-        # True magnetising reactance: Xm = X0 - X1 (X0 is the total no-load
-        # reactance, X1 = alpha * Xtot is fixed in this step). This removes the
-        # former X1 double-count: Z0 = R1 + j(X1 + Xm) = R1 + j X0.
-        Xm = self.X0 - X1
-        if Xm <= 0.0:
-            return None
+    def _residuals_x1x2(self, x: np.ndarray, R2: float, Xm: float) -> np.ndarray:
+        """Full-load residual vector [r1, r2, r3] for candidate (X1, X2).
 
-        Z0 = complex(self.R1_hot, X1 + Xm)
-        I0 = abs(self.V_ph / Z0)
-        p_fw = self.case.P_FW if self.case.P_FW is not None else 0.0
-        p_core = self.case.P_core if self.case.P_core is not None else max(self.case.P_0 - 3.0 * self.I_0_ph**2 * self.R1_hot - p_fw, EPS)
-        P0 = 3.0 * I0**2 * self.R1_hot + p_core + p_fw
+        r1, r2: real/imag current-matching error (plan §3.1), normalised by I_FL_ph.
+        r3:     full-load torque error (plan §3.3), normalised by T_FL.
+        Xm is fixed within one interior solve and refreshed in the outer loop.
+        """
+        X1, X2 = float(x[0]), float(x[1])
+        if Xm <= 0.0 or X1 >= 0.999 * min(Xm, self.XLR) or X2 <= 0.0:
+            return np.array([1e12, 1e12, 1e12])
 
-        # full-load with shunt branch included
         Zm = complex(0.0, Xm)
-        Zr = complex(R2 / max(self.s_FL, EPS), X2)
-        Zpar = self._zpar(Zm, Zr)
-        Zin = complex(self.R1_hot, X1) + Zpar
-        IFL = abs(self.V_ph / Zin)
-        PF = max(min(Zin.real / abs(Zin), 1.0), 0.0)
-        # 3-phase input power from per-phase quantities (valid for Y and Δ).
-        Pin = 3.0 * self.V_ph * IFL * PF
-        ETA = self.case.P_out * HP_TO_WATT / max(Pin, EPS)
-        Vnode = self.V_ph * (Zpar / Zin)
-        Ir = abs(Vnode / Zr)
-        TFL = 3.0 * (Ir**2) * (R2 / max(self.s_FL, EPS)) / max(self.omega_s, EPS)
+        Z2 = complex(R2 / max(self.s_FL, EPS), X2)
+        Zpar = self._zpar(Zm, Z2)
+        Zfl = complex(self.R1_hot, X1) + Zpar
+        I_pred = self.V_ph / Zfl
 
-        # LR / BD auxiliary quantities retained for reporting
-        Rlr = self.R1_hot + self.R3
-        Zlr = abs(complex(Rlr, self.XLR))
-        ILR = self.V_ph / max(Zlr, EPS)
-        TLR = (3.0 / max(self.omega_s, EPS)) * self.V_ph**2 * self.R3 / max(Zlr**2, EPS)
-        # KNOWN-UNKNOWN: Simplified-circuit breakdown-slip prediction (neglects Xm path).
-        # Inherits any bias in Xtot from the shunt-correction seed.
-        sBDm = R2 / max(math.sqrt(self.R1_hot**2 + self.Xtot**2), EPS)
+        r1 = (I_pred.real - self.I_FL_vec.real) / max(self.I_FL_ph, EPS)
+        r2 = (I_pred.imag - self.I_FL_vec.imag) / max(self.I_FL_ph, EPS)
 
-        return {
-            'R2': R2,
-            'X1': X1,
-            'X2': X2,
-            'X3': X3,
-            'Xm': Xm,
-            'R3': self.R3,
-            'I0': I0,
-            'P0': P0,
-            'IFL': IFL,
-            'PF': PF,
-            'ETA': ETA,
-            'TFL': TFL,
-            'ILR': ILR,
-            'TLR': TLR,
-            'sBD': sBDm,
-        }
+        # Rotor current by current division (plan §3.3), using the measured
+        # load current phasor, then the full-load torque equation.
+        I2 = self.I_FL_vec * Zm / max(abs(Zm + Z2), EPS)
+        T_calc = (
+            3.0 * abs(I2) ** 2 * ((1.0 - self.s_FL) / max(self.s_FL, EPS)) * R2
+            / max(self.omega_s, EPS)
+        )
+        r3 = (T_calc - self.T_FL) / max(self.T_FL, EPS)
+        return np.array([r1, r2, r3])
 
-    def fit(self):
-        # KNOWN-UNKNOWN: The objective mixes six error terms; the minimiser may
-        # trade off errors rather than converge to a physically meaningful solution.
-        # Since Xtot and X0 are fixed, solve only R2 for each alpha and choose best alpha.
-        # (Xm = X0 - X1 is resolved inside _predict for each alpha.)
-        tols = {
-            'I0': max(0.05 * self.I_0_ph, 1e-6),
-            'P0': max(0.05 * self.case.P_0, 1e-6),
-            'TFL': max(0.05 * self.T_FL, 1e-6),
-            'IFL': max(0.03 * self.I_FL_ph, 1e-6),
-            'PFFL': max(0.01 * self.case.PF_FL, 1e-6),
-            'ETAFL': max(0.01 * self.case.eta_FL, 1e-6),
-        }
+    def _solve_x1_x2(self, R2: float, Xm: float) -> dict | None:
+        # Bounds (plan §3.4): X1>0, X2>0, Xm > X1, X3 = X_LR - X1 > 0.
+        x1_hi = 0.999 * min(Xm, self.XLR)
+        x2_hi = max(2.0 * self.X0, 1.0)
+        lo = np.array([1e-9, 1e-9])
+        hi = np.array([x1_hi, x2_hi])
+
+        if not _HAS_SCIPY:
+            raise RuntimeError("Stage 3 solver requires scipy.optimize.least_squares")
 
         best = None
-        # KNOWN-UNKNOWN: Alpha grid is coarse (6 discrete values) with uneven
-        # spacing. The true X1/X2 split may lie far from any candidate.
-        for alpha in [0.30, 0.35, 0.39, 0.40, 0.45, 0.50]:
-            def obj_r2(R2: float):
-                pred = self._predict(alpha, R2)
-                if pred is None:
-                    return 1e12
-                r = {
-                    'I0': (pred['I0'] - self.I_0_ph) / tols['I0'],
-                    'P0': (pred['P0'] - self.case.P_0) / tols['P0'],
-                    'TFL': (pred['TFL'] - self.T_FL) / tols['TFL'],
-                    'IFL': (pred['IFL'] - self.I_FL_ph) / tols['IFL'],
-                    'PFFL': (pred['PF'] - self.case.PF_FL) / tols['PFFL'],
-                    'ETAFL': (pred['ETA'] - self.case.eta_FL) / tols['ETAFL'],
-                }
-                return sum(v * v for v in r.values())
-
-            # KNOWN-UNKNOWN: R2 bounds [1e-6, 0.2] hardcoded and motor-size-dependent.
-            # Fallback R2 = 0.05 when SciPy unavailable is arbitrary.
-            if _HAS_SCIPY:
-                res = minimize_scalar(obj_r2, bounds=(1e-6, 0.2), method='bounded')
-                R2_best = float(res.x)
-                score = float(res.fun)
-            else:
-                R2_best = 0.05
-                score = obj_r2(R2_best)
-
-            pred = self._predict(alpha, R2_best)
-            if best is None or score < best['score']:
-                best = {'alpha_best': alpha, 'score': score, **pred}
-
-        best['R1_hot'] = self.R1_hot
-        best['R1_cold'] = self.case.R1_cold
-        best['X1_plus_X2'] = self.Xtot
-        best['Xsum_seed_from_shunt'] = self._seed_meta['Z_sr'].imag
-        best['Xsum_seed_realpart'] = self._seed_meta['Z_sr'].real
-        best['I_fl_complex'] = self._seed_meta['I_fl']
-        best['I_sh_complex'] = self._seed_meta['I_sh']
-        best['I_sr_complex'] = self._seed_meta['I_sr']
+        for x1_frac in (0.02, 0.05, 0.15):
+            for x2_frac in (0.02, 0.05, 0.15):
+                x0 = np.array([x1_frac * x1_hi, x2_frac * x2_hi])
+                try:
+                    res = least_squares(
+                        self._residuals_x1x2, x0, args=(R2, Xm),
+                        bounds=(lo, hi), method="trf",
+                        xtol=1e-12, ftol=1e-12, gtol=1e-12, max_nfev=400,
+                    )
+                except Exception:
+                    continue
+                score = float(np.sum(res.fun ** 2))
+                if best is None or score < best["score"]:
+                    best = {
+                        "X1": float(res.x[0]),
+                        "X2": float(res.x[1]),
+                        "score": score,
+                    }
         return best
+
+    # -- Stage 4: outer iteration ------------------------------------------
+
+    def fit(self) -> dict:
+        warnings = set()
+
+        # Validate phase conversion early (plan warning flag list).
+        if not (math.isfinite(self.I_FL_ph) and self.I_FL_ph > 0.0 and
+                math.isfinite(self.V_ph) and self.V_ph > 0.0):
+            warnings.add("invalid_phase_conversion")
+        if getattr(self, "_lr_impedance_invalid", False):
+            warnings.add("invalid_locked_rotor_impedance")
+
+        # R2 prior from the standalone dataset model. It is constant during
+        # the outer loop for Models B/D, but is recomputed here so the loop
+        # stays generic if the model gains X1-dependent predictors.
+        r2_info = estimate_r2_from_r3(
+            self.R3, self.s_FL, self.case.P, self.case.P_out
+        )
+        if r2_info["out_of_range"]:
+            warnings.add("dataset_model_out_of_range")
+        if not r2_info["pole_match"]:
+            warnings.add("dataset_model_fallback_used")
+        R2 = r2_info["r2"]
+        if r2_info["clamped"]:
+            warnings.add("R2_greater_than_R3")
+        if R2 <= 0.0 or self.R3 <= 0.0:
+            warnings.add("negative_or_zero_parameter")
+
+        # Initialisation (plan §4.1 steps 7-9).
+        X1 = 0.0
+        Xm = self.X0 - X1
+        best = None
+
+        for it in range(1, MAX_OUTER_ITER + 1):
+            X1_old, Xm_old = X1, Xm
+            sol = self._solve_x1_x2(R2, Xm)
+            if sol is None:
+                warnings.add("non_convergence")
+                break
+
+            X1 = sol["X1"]
+            X2 = sol["X2"]
+            score = sol["score"]
+            Xm_new = self.X0 - X1
+            X3_new = self.XLR - X1
+
+            best = {
+                "X1": X1,
+                "X2": X2,
+                "Xm": Xm_new,
+                "X3": X3_new,
+                "R2": R2,
+                "score": score,
+                "outer_iterations": it,
+            }
+
+            conv_abs = abs(X1 - X1_old) < TOL_ABS and abs(Xm_new - Xm_old) < TOL_ABS
+            conv_rel = (
+                abs(X1 - X1_old) / max(abs(X1_old), EPS) < TOL_REL
+                and abs(Xm_new - Xm_old) / max(abs(Xm_old), EPS) < TOL_REL
+            )
+            Xm, X3 = Xm_new, X3_new
+            if conv_abs and conv_rel:
+                best["converged"] = True
+                break
+
+        if best is None:
+            return {
+                "converged": False,
+                "outer_iterations": 0,
+                "solver_score": float("inf"),
+                "warning_flags": sorted(warnings),
+            }
+
+        if not best.get("converged", False):
+            warnings.add("non_convergence")
+
+        # --- Post-solve physical checks (plan §4.3) ------------------------
+        X1, X2, Xm, X3 = best["X1"], best["X2"], best["Xm"], best["X3"]
+        R1_cold = self.case.R1_cold
+
+        if self.R1_hot <= R1_cold or R1_cold <= 0.0:
+            warnings.add("invalid_temperature_correction")
+        if self.R3 <= R2 or self.R3 <= 0.0:
+            warnings.add("R3_not_greater_than_R2")
+        if min(X1, X2, Xm, X3, R2) <= 0.0:
+            warnings.add("negative_or_zero_parameter")
+        if Xm <= X1:
+            warnings.add("Xm_not_greater_than_X1")
+        if X3 <= 0.0:
+            warnings.add("X3_not_positive")
+        if not (0.0 < self.s_FL < 1.0):
+            warnings.add("slip_out_of_range")
+
+        # Full-load match quality (recomputed residual vector).
+        r_final = self._residuals_x1x2(np.array([X1, X2]), R2, Xm)
+        current_err = math.hypot(r_final[0], r_final[1])
+        torque_err = abs(r_final[2])
+        if current_err > 0.03:
+            warnings.add("poor_full_load_current_match")
+        if torque_err > 0.05:
+            warnings.add("poor_full_load_torque_match")
+
+        # --- Assemble output (plan "Required output fields") ---------------
+        Xtot = X1 + X2
+        out = {
+            "R1_cold": R1_cold,
+            "R1_hot": self.R1_hot,
+            "R2": R2,
+            "R3": self.R3,
+            "X1": X1,
+            "X2": X2,
+            "X3": X3,
+            "Xm": Xm,
+            "X0": self.X0,
+            "XLR": self.XLR,
+            "s_fl": self.s_FL,
+            "T_FL": self.T_FL,
+            "I_FL_ph": self.I_FL_ph,
+            "I_LR_ph": self.I_LR_ph,
+            "I_0_ph": self.I_0_ph,
+            "converged": bool(best.get("converged", False)),
+            "outer_iterations": int(best["outer_iterations"]),
+            "solver_score": float(best["score"]),
+            "warning_flags": sorted(warnings),
+            "R2_R3_ratio": R2 / max(self.R3, EPS),
+            "Xm_X1_ratio": Xm / max(X1, EPS),
+            "X1_X2_ratio": X1 / max(X2, EPS),
+            "X3_X2_ratio": X3 / max(X2, EPS),
+            "Xtot": Xtot,
+        }
+        return out

@@ -2,10 +2,15 @@
 Example-design equivalent circuit calculator based on EquivalentCircuitParameters Rev.5.xlsx.
 
 Usage:
-    python examples_calculator.py examples_input.csv examples_eq_results.csv
+    python eq_calculator.py
+
+Defaults to eq_raw.csv for input and eq_parameters.csv for output; both can
+be overridden positionally:
+
+    python eq_calculator.py some_input.csv some_output.csv
 
 Optional Excel output:
-    python examples_calculator.py examples_input.csv examples_eq_results.csv --xlsx examples_eq_results.xlsx
+    python eq_calculator.py --xlsx eq_parameters.xlsx
 
 Notes:
 - Jconn = 3 for Delta; otherwise 1.
@@ -169,13 +174,13 @@ def calculate_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Calculate equivalent circuit parameters for each CSV row.")
-    parser.add_argument("input_csv", help="Input CSV path")
-    parser.add_argument("output_csv", help="Output CSV path")
+    parser.add_argument("eq_raw", nargs="?", default="eq_raw.csv", help="Input CSV path (default: eq_raw.csv)")
+    parser.add_argument("eq_parameters", nargs="?", default="eq_parameters.csv", help="Output CSV path (default: eq_parameters.csv)")
     parser.add_argument("--xlsx", help="Optional Excel output path", default=None)
     args = parser.parse_args()
 
-    input_path = Path(args.input_csv)
-    output_csv = Path(args.output_csv)
+    input_path = Path(args.eq_raw)
+    output_csv = Path(args.eq_parameters)
 
     df = pd.read_csv(input_path)
     out = calculate_dataframe(df)

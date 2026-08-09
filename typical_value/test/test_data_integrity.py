@@ -29,7 +29,7 @@ from data_checks import (  # noqa: E402
     check_row_count,
     check_xm_dominance,
 )
-from examples_calculator import calculate_dataframe  # noqa: E402
+from typical_value.eq_calculator import calculate_dataframe  # noqa: E402
 
 RESULTS_CSV = Path(__file__).resolve().parent.parent / "examples_eq_results.csv"
 INPUT_CSV = Path(__file__).resolve().parent.parent / "examples_input.csv"
