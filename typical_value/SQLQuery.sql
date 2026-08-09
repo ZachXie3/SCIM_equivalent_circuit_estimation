@@ -1,5 +1,4 @@
-SELECT TOP (1000)
-      D.[RatingID]
+SELECT D.[RatingID]
     , D.[PoleSpeed]
     , D.[MotorRotorInertia]
     , D.[Connection]
