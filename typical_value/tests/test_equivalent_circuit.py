@@ -14,11 +14,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+_TV = Path(__file__).resolve().parent.parent
+_ROOT = _TV.parent
+sys.path.insert(0, str(_TV))
+sys.path.insert(0, str(_ROOT))
 
 import equivalent_circuit as e  # noqa: E402
 
-RESULTS_CSV = Path(__file__).resolve().parent.parent / "examples_eq_results.csv"
+RESULTS_CSV = _TV / "data" / "eq_parameters.csv"
 
 
 def _make_case() -> e.MotorCase:

@@ -12,9 +12,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from data_checks import check_all, load_results
 
-DEFAULT_CSV = Path(__file__).resolve().parent / "examples_eq_results.csv"
+DEFAULT_CSV = Path(__file__).resolve().parent / "data" / "eq_parameters.csv"
 
 
 def main() -> int:

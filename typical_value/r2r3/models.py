@@ -1,7 +1,7 @@
-"""Dataset-driven R2/R3 models (plan.md Stage 2.4).
+"""Power-law R2/R3 models (plan.md Stage 2.4).
 
-Models express the running/standstill rotor resistance ratio as an
-empirical function of readily-available nameplate quantities:
+Models express the running/standstill rotor resistance ratio as an empirical
+function of readily-available nameplate quantities:
 
     Model A:  R2/R3 = constant
     Model B:  R2/R3 = f(s_fl)
@@ -11,9 +11,9 @@ empirical function of readily-available nameplate quantities:
 (Enclosure-based variants were dropped by review — the frame-size code is
 an unreliable enclosure proxy.)
 
-Each model is fitted on ``examples_eq_results.csv``, predicts R2 from R3,
-and is scored with MAE, RMSE, and P10/P50/P90 relative-error bands. The
-simplest model whose RMSE is within ``tolerance`` of the best is selected.
+Each model is fitted on ``data/eq_parameters.csv``, predicts R2 from R3, and
+is scored with MAE, RMSE, and P10/P50/P90 relative-error bands. The simplest
+model whose RMSE is within ``tolerance`` of the best is selected.
 
 Power-law form (fitted in log-log space):
 
@@ -22,36 +22,20 @@ Power-law form (fitted in log-log space):
     with group-dependent (a, b) per pole count for Models C / D.
 
 Usage:
-    python r2r3_model.py                    # print scoring table
-    python r2r3_report.py                   # write r2r3_report.md
+    python r2r3/models.py                    # print scoring table
+    python r2r3/report.py                    # write reports/r2r3_report.md
 """
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Mapping
 
 import numpy as np
 import pandas as pd
 
-DEFAULT_CSV = Path(__file__).resolve().parent / "examples_eq_results.csv"
+from .data import add_slip, load_results, valid_rows
 
 MODEL_NAMES = ("A", "B", "C", "D")
-
-
-def load_results(path: Path | str = DEFAULT_CSV) -> pd.DataFrame:
-    return pd.read_csv(path)
-
-
-def add_slip(df: pd.DataFrame) -> pd.DataFrame:
-    """Add full-load slip column ``s_fl`` from nameplate values."""
-    ns = 120.0 * df["Frequency"] / df["PoleSpeed"]
-    return df.assign(s_fl=(ns - df["RPM"]) / ns)
-
-
-def valid_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """Rows usable for fitting: s_fl > 0 and HP > 0."""
-    return df[(df["s_fl"] > 0) & (df["HorsePower"] > 0)]
 
 
 # ---------------------------------------------------------------------------
@@ -190,71 +174,12 @@ def score_table(df: pd.DataFrame) -> tuple[list[dict], str]:
 
 
 # ---------------------------------------------------------------------------
-# Grouping-constant exploration (group R2/R3 by categorical keys, constant per group)
-# ---------------------------------------------------------------------------
-
-
-def score_grouped_constant(df: pd.DataFrame, keys: list[str], label: str) -> dict:
-    """Constant geometric-mean R2/R3 per group; report group count + error."""
-    keys = list(keys)
-    sub = df.assign(_lr=np.log(df["R2"] / df["R3"]))
-    ratio = np.exp(sub.groupby(keys, observed=True)["_lr"].transform("mean"))
-    pred = ratio * df["R3"]
-    rel = (pred - df["R2"]) / df["R2"]
-    return {
-        "label": label,
-        "keys": keys,
-        "n_groups": int(sub.groupby(keys, observed=True).ngroups),
-        "n": int(len(df)),
-        "RMSE_rel": float(np.sqrt((rel**2).mean())),
-        "MAE_rel": float(rel.abs().mean()),
-    }
-
-
-GROUPING_CANDIDATES = {
-    "voltage": ["Voltage"],
-    "pole": ["PoleSpeed"],
-    "pole + voltage": ["PoleSpeed", "Voltage"],
-    "HP bucket": ["hp_bucket"],
-    "pole + HP bucket": ["PoleSpeed", "hp_bucket"],
-    "voltage + HP bucket": ["Voltage", "hp_bucket"],
-    "pole + voltage + HP bucket": ["PoleSpeed", "Voltage", "hp_bucket"],
-    "slip bin": ["slip_bin"],
-    "pole + slip bin": ["PoleSpeed", "slip_bin"],
-    "HP bucket + slip bin": ["hp_bucket", "slip_bin"],
-    "pole + HP + slip bin": ["PoleSpeed", "hp_bucket", "slip_bin"],
-    "pole + voltage + slip bin": ["PoleSpeed", "Voltage", "slip_bin"],
-}
-
-
-def add_exploration_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Add the categorical columns used by the grouping exploration.
-
-    - ``hp_bucket``: {<=100, 101-500, 501-1000, 1001-2000, 2000+}
-    - ``slip_bin``: 10 fine bins densest below 5 % slip.
-    """
-    df = df.copy()
-    bins_hp = [0, 100, 500, 1000, 2000, np.inf]
-    labels_hp = ["<=100", "101-500", "501-1000", "1001-2000", "2000+"]
-    df["hp_bucket"] = pd.cut(df["HorsePower"], bins=bins_hp, labels=labels_hp).astype(str)
-    slip_edges = [0, 0.005, 0.0075, 0.01, 0.0125, 0.015, 0.0175, 0.02, 0.025, 0.03, 0.04, 1.0]
-    df["slip_bin"] = pd.cut(df["s_fl"], bins=slip_edges, right=False).astype(str)
-    return df
-
-
-def grouping_score_table(df: pd.DataFrame) -> list[dict]:
-    return [score_grouped_constant(add_exploration_columns(df), keys, label)
-            for label, keys in GROUPING_CANDIDATES.items()]
-
-
-# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 
 def main() -> None:
-    df = add_slip(load_results())
-    df = valid_rows(df)
+    df = valid_rows(add_slip(load_results()))
     rows, selected = score_table(df)
 
     print(f"Rows used for fitting: {len(df)} (invalid slip / HP excluded)")

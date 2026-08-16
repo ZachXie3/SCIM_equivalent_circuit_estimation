@@ -4,8 +4,8 @@ Example-design equivalent circuit calculator based on EquivalentCircuitParameter
 Usage:
     python eq_calculator.py
 
-Defaults to eq_raw.csv for input and eq_parameters.csv for output; both can
-be overridden positionally:
+Defaults to data/eq_raw.csv for input and data/eq_parameters.csv for output;
+both can be overridden positionally:
 
     python eq_calculator.py some_input.csv some_output.csv
 
@@ -168,15 +168,15 @@ def calculate_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Missing required column(s): {missing}")
 
-    results = pd.DataFrame([calculate_row(row) for row in df.to_dict("records")], index=df.index)
+    results = pd.DataFrame([calculate_row(row) for row in df.to_dict("records")], index=df.index) # type: ignore
     return pd.concat([df.copy(), results[OUTPUT_COLUMNS]], axis=1)
 
 
 def main() -> None:
     SCRIPT_DIR = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description="Calculate equivalent circuit parameters for each CSV row.")
-    parser.add_argument("eq_raw", nargs="?", default=SCRIPT_DIR/"eq_raw.csv", help="Input CSV path (default: eq_raw.csv)")
-    parser.add_argument("eq_parameters", nargs="?", default=SCRIPT_DIR/"eq_parameters.csv", help="Output CSV path (default: eq_parameters.csv)")
+    parser.add_argument("eq_raw", nargs="?", default=SCRIPT_DIR/"data"/"eq_raw.csv", help="Input CSV path (default: data/eq_raw.csv)")
+    parser.add_argument("eq_parameters", nargs="?", default=SCRIPT_DIR/"data"/"eq_parameters.csv", help="Output CSV path (default: data/eq_parameters.csv)")
     parser.add_argument("--xlsx", help="Optional Excel output path", default=None)
     args = parser.parse_args()
 

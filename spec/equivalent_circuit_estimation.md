@@ -72,9 +72,9 @@ This applies at **every** operating point (full-load, locked-rotor, no-load) —
 | `alpha` | Split ratio `X1 / (X1 + X2)` | — |
 | `Zbase` | Base impedance `V_LL / (√3 · I_FL)` | Ω |
 
-### Mapping to the example-design results (`typical_value/examples_eq_results.csv`)
+### Mapping to the example-design results (`typical_value/data/eq_parameters.csv`)
 
-Typical values are extracted from **`examples_eq_results.csv`** (input columns + computed
+Typical values are extracted from **`eq_parameters.csv`** (input columns + computed
 per-phase circuit columns), not from the raw inputs. Each canonical symbol maps to a column of
 that results file:
 
@@ -110,7 +110,7 @@ end-ring inputs (retained in the results file under their original column names)
 `Jconn` / `Xcorr` conventions of `EquivalentCircuitParameters Rev.5.xlsx`:
 
 - `Jconn = 3` for Δ/Delta, `1` otherwise; `Xcorr = 2/3` for `PoleSpeed ≤ 4`, `1/2` otherwise
-  (see `examples_calculator.py`).
+  (see `typical_value/eq_calculator.py`).
 
 `R1_hot` in `equivalent_circuit.py` uses default `T_ambient_C = 25` and `temp_rise_C = 80`, i.e.
 105 °C — the same temperature as the dataset's `R1`.

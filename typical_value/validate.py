@@ -1,7 +1,7 @@
 """Stage 5 validation harness (plan.md §5).
 
 Runs the Stages 1-4 equivalent-circuit estimation pipeline over
-``examples_eq_results.csv`` (4,183 ground-truth design rows) and compares the
+``data/eq_parameters.csv`` (4,195 ground-truth design rows) and compares the
 predicted per-phase parameters against the dataset's ``R2, R3, X1, X2, X3,
 Xm`` columns.
 
@@ -39,9 +39,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import equivalent_circuit as ec  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
-RESULTS_CSV = ROOT / "examples_eq_results.csv"
-OUTPUT_CSV = ROOT / "validation_results.csv"
-REPORT_MD = ROOT / "validation_report.md"
+RESULTS_CSV = ROOT / "data" / "eq_parameters.csv"
+OUTPUT_CSV = ROOT / "reports" / "validation_results.csv"
+REPORT_MD = ROOT / "reports" / "validation_report.md"
 
 T_AMB = 25.0
 T_RISE = 80.0
@@ -183,7 +183,7 @@ def _build_dyn(df: pd.DataFrame) -> pd.DataFrame:
     dyn["hp"] = df["HorsePower"].to_numpy(dtype=float)
     dyn["f"] = df["Frequency"].to_numpy(dtype=float)
     dyn["n_FL"] = df["RPM"].to_numpy(dtype=float)
-    dyn["design_id"] = df["DesignAuditID"].to_numpy()
+    dyn["design_id"] = df.index.to_numpy()
     dyn["Connection"] = df["Connection"].astype(str).to_numpy()
     return pd.DataFrame(dyn)
 
@@ -425,27 +425,27 @@ def run_reference(df: pd.DataFrame, indices: np.ndarray) -> tuple[list[dict], fl
 def _attach_ground_cols(res: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
     """Copy ground-truth/serving columns onto the estimates for the report.
 
-    Ground-truth parameter columns get a ``gt_`` prefix so they never clobber
-    the estimate columns of the same name.
+    ``res`` is produced row-by-row in the same order as ``df``, so columns are
+    aligned by position (the dataset has no unique design id; ``design_id``
+    carries the source row index). Ground-truth parameter columns get a
+    ``gt_`` prefix so they never clobber the estimate columns of the same name.
     """
-    gt = df.set_index("DesignAuditID")
     res = res.copy()
     for c in ["Connection", "Voltage", "HorsePower", "Frequency",
               "RPM", "Amps", "NoLoadAmps", "WindingResistAt105"]:
-        if c in gt.columns:
-            res[c] = gt.loc[res["design_id"], c].to_numpy()
-    res["Pole"] = gt.loc[res["design_id"], "PoleSpeed"].to_numpy()
+        if c in df.columns:
+            res[c] = df[c].to_numpy()
+    res["Pole"] = df["PoleSpeed"].to_numpy()
     for p in METRIC_PARAMS:
-        res[f"gt_{p}"] = gt.loc[res["design_id"], p].to_numpy(dtype=float)
+        res[f"gt_{p}"] = df[p].to_numpy(dtype=float)
     return res
 
 
 def compute_errors(res: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
-    """Relative errors for METRIC_PARAMS (plan §5.3)."""
-    gi = df.set_index("DesignAuditID")
+    """Relative errors for METRIC_PARAMS (plan §5.3), aligned by row order."""
     out = res.copy()
     for p in METRIC_PARAMS:
-        gt_v = gi.loc[res["design_id"], p].to_numpy(dtype=float)
+        gt_v = df[p].to_numpy(dtype=float)
         est_v = res[p].to_numpy(dtype=float)
         denom = np.where(np.abs(gt_v) > 1e-12, np.abs(gt_v), np.inf)
         out[f"err_{p}"] = (est_v - gt_v) / denom

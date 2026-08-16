@@ -7,7 +7,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_TV = Path(__file__).resolve().parent.parent
+_ROOT = _TV.parent
+sys.path.insert(0, str(_TV))
+sys.path.insert(0, str(_ROOT))
 
 import validate as v  # noqa: E402
 

@@ -153,7 +153,7 @@ empirical relationship (§2.4), not from the analytic skin-effect formula.
 
 - The exact skin-effect model is infeasible: it needs bar depth and material properties
   (`h`, `mu`, `sigma`) that are not available to the user.
-- The historical dataset (`examples_eq_results.csv`, see Stage 5) contains both `R2` (running) and `R3` (standstill) for
+- The historical dataset (`typical_value/data/eq_parameters.csv`, see Stage 5) contains both `R2` (running) and `R3` (standstill) for
   fully-specified designs, so the `R2/R3` ratio can be modelled as an empirical function of
   readily-available nameplate quantities — slip, pole count, efficiency band.
 - The skin-effect theory in §2.2 remains the physical justification for *why* `R2` and `R3`
@@ -170,7 +170,7 @@ If the calculated `R2` violates these expectations, flag the case and fall back 
 
 ### 2.4 Dataset-driven R2/R3 model (R2 prior) — THE IMPLEMENTATION
 
-The historical dataset (`examples_eq_results.csv`, see Stage 5) provides the empirical `R2/R3` relationship used to derive
+The historical dataset (`typical_value/data/eq_parameters.csv`, see Stage 5) provides the empirical `R2/R3` relationship used to derive
 R2 from R3; it seeds the solver or acts as a soft constraint.
 
 Candidate models (power-law in log-log space), scored by MAE / RMSE / P10-P50-P90 of
@@ -210,7 +210,7 @@ Horsepower may provide smaller incremental improvement.
 
 ### 2.5 Decision (tentative) — adopt Model D
 
-Analysis on the 4,180-row dataset (`typical_value/r2r3_report.md`, `§4`) supports Model D:
+Analysis on the 4,180-row dataset (`typical_value/reports/r2r3_report.md`, `§4`) supports Model D:
 
 | Model | Predictors | RMSE (%) |
 |---|---|---|
@@ -226,7 +226,7 @@ R2/R3 = exp(b) * s_fl^a * HP^c
 R2 = R3 * exp(b) * s_fl^a * HP^c
 ```
 
-Coefficients (see `typical_value/r2r3_report.md` §5):
+Coefficients (see `typical_value/reports/r2r3_report.md` §5):
 
 | Poles | a | c | b |
 |---|---|---|---|
@@ -295,6 +295,87 @@ This allows:
 - Better robustness for unusual or future designs.
 
 This architecture should be considered the preferred end-state for the estimator.
+
+### 2.7 Factor review and the simple community-facing model (added after 2.4/2.5)
+
+A factor review was run on the dataset (see `typical_value/reports/r2r3_report.md` §9-§11) to
+answer: *can R2/R3 be treated as a constant per nameplate factor, so the estimator can
+be simplified to a table a practising engineer can apply by hand?* Each factor was
+scored against the Model D residual (per-pole `s_fl^a * HP^c`, baseline RMSE 24.1%).
+
+| Factor | eta^2 (vs Model D resid) | RMSE with factor | verdict |
+|---|---|---|---|
+| Rotor bar geometry (`RotorSlotType`) | 0.249 | 20.5% | strong |
+| Rotor material (`BarMaterial` = `ERMaterial`) | 0.145 | 21.5% | strong, 1:1 with slot shape |
+| `NemaKVACode` | 0.085 | 22.4% | moderate; coarse bin of LR current |
+| `NemaDesign` | 0.032 | 22.5% | weak |
+| `Name` (efficiency level) | 0.033 | 23.5% | weak; material leakage |
+| Pole count | 0.000 | — | already in per-pole coefficients |
+| `FrameSize` | — | r = 0.07 | none |
+| `LockedRotorAmps`/`Amps` | — | partial r = 0.16 | weak; pole proxy |
+
+Conclusions:
+
+- **Efficiency level ("Name"), NemaDesign, FrameSize: not usable** — spread within a
+  group is far wider than the offset between groups.
+- **NemaKVACode / LockedRotorAmps:Amps: not linear and mostly a pole proxy** — a
+  coarse, redundant descriptor.
+- **Pole count alone is not a constant** — a per-pole constant has RMSE 67-100%;
+  slip must be in the formula.
+- **Rotor bar geometry is the master variable** (`RotorSlotType`, internal
+  diagnostic only — an end user does not know the slot shape), perfectly
+  confounded with material (AL -> Dbl - Closed / Diamond / Oval; CU / Special ->
+  Rectang / Trapeze). The five shapes behave very differently:
+
+  | RotorSlotType | Material | n | geo-mean R2/R3 | slip exponent |
+  |---|---|---|---:|---:|
+  | Diamond | AL | 633 | 1.0000 (std 0) | 0.00 |
+  | Oval | AL | 26 | 1.0000 (std 0) | 0.00 |
+  | Trapeze | CU/Special | 265 | 0.226 | ≈0 |
+  | Rectang | CU/Special | 148 | 0.320 | +0.16 |
+  | Dbl - Closed | AL | 3120 | 0.281 | +0.82 |
+
+  Diamond/Oval are shallow low bars with negligible skin effect (`R2 = R3` exactly in
+  the design tool). Trapeze/Rectang are deep bars whose ratio is essentially a fixed
+  geometry constant. Only Dbl - Closed (deep closed / double-cage) needs a slip law.
+  This structure sets the achievable accuracy of any nameplate-only method but is
+  not usable as a predictor itself.
+
+**Suggested path — simple empirical method for the electrical community**
+
+The recommended end-user estimator uses **only nameplate-available quantities**
+(slip from RPM/poles/frequency, and HorsePower). No pole grouping, no rotor
+material, no slot geometry (slot geometry explains the residual but is not known
+to an end user; see `reports/r2r3_report.md` §10).
+
+```text
+R2/R3 = 7.1 * s_fl^0.57 / HorsePower^0.12        (s_fl = full-load slip)
+```
+
+- RMSE ≈ 27% (relative), P10–P90 ≈ −27% to +33% on R2 — within ~1 pp of the
+  per-pole Model D (26.0%) with three coefficients and no grouping.
+- If only slip is trusted: `R2/R3 = 20.3 * s_fl^0.92` (RMSE 32.8%).
+- Clamp the result to `R3 >= R2` (the formula stays ≤ 1.0 over the whole dataset
+  slip range; the estimator already clamps).
+- If implemented in the estimator, replace `R2R3_MODEL_D` with this global law;
+  Model D remains available as the historical reference.
+
+**Approved alternative — slip-segment lookup table** (for hand use; no exponent
+math). One constant `R2/R3` per slip band; `s_fl >= 5%` is taken as **1.0**
+(trend extrapolation, only 12 rows above 5%):
+
+| Slip band | n | R2/R3 | Bin RMSE (%) |
+|---|---:|---:|---:|
+| < 0.5% | 199 | 0.170 | 53.5 |
+| 0.5–1% | 1526 | 0.202 | 28.7 |
+| 1–2% | 1455 | 0.359 | 34.1 |
+| 2–3% | 684 | 0.735 | 39.9 |
+| 3–5% | 316 | 0.917 | 25.4 |
+| ≥ 5% | 12 | 1.000 | 49.5 |
+
+Overall RMSE ≈ 34%, MAE ≈ 26% (n = 4192). Roughly as accurate as the slip-only
+power law; ~7 pp behind the continuous slip+HP formula. `reports/r2r3_report.md` §11.1
+carries per-bin P10–P90 bands.
 
 ---
 
@@ -498,12 +579,12 @@ These are diagnostic values only. They shall not be used as alpha-based constrai
 
 ### 5.1 Objective
 
-`typical_value/examples_eq_results.csv` (4,183 rows) carries two kinds of information:
+`typical_value/data/eq_parameters.csv` (4,195 rows) carries two kinds of information:
 
 1. **Nameplate / design inputs** the estimator is allowed to consume (voltage, frequency,
    poles, speed, HP, amps, no-load amps, connection, winding resistance at 105 °C), plus
 2. **ground-truth per-phase circuit parameters** (`R1`, `R2`, `R3`, `X1`, `X2`, `X3`, `Xm`)
-   computed by the same design-tool calculator (`examples_calculator.py`).
+   computed by the same design-tool calculator (`typical_value/eq_calculator.py`).
 
 This stage runs the Stages 1-4 pipeline over every row, compares the predicted per-phase
 circuit against the ground-truth columns, and reports where the estimator is close and where
@@ -615,7 +696,7 @@ The validation harness must:
 ### 5.5 Deliverables
 
 - `typical_value/validate.py` (batch runner + metric tables) with `pytest` sub-checks
-- `typical_value/validation_report.md` generated by a report script
+- `typical_value/reports/validation_report.md` generated by a report script
 - report the per-parameter metrics, group breakdowns, flag/coverage counts, and runtime
   comparison
 - any outlier families flagged for the estimator to rehandle
