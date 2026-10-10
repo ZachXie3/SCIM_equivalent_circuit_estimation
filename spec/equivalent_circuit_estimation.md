@@ -134,24 +134,31 @@ All formulas assume the **per-phase** equivalent circuit below (stator & rotor r
 
 ### A1. Per-phase voltage
 
+The equivalent circuit is the **wye-equivalent** per-phase circuit, so the
+per-phase voltage is the same for both connections:
+
 ```
-        V_LL / √3    (Y / Wye connection)
-V_ph =
-        V_LL         (Δ/Delta connection)
+V_ph = V_LL / √3        (Y and Δ)
 ```
+
+Rationale: the circuit values are the wye-equivalent per-phase parameters —
+for a delta-connected machine the delta-to-wye impedance conversion
+(`Z_y = Z_d / 3`) is applied by `Jconn` in `eq_calculator.py`, so the
+per-phase (wye-equivalent) voltage is always `V_LL / √3` and the per-phase
+current is always the line current (A1b).
 
 The rated line voltage `V_LL` is the same at every operating point (full-load, locked-rotor,
 no-load), so a single `V_ph` applies throughout.
 
 ### A1b. Per-phase currents
 
-Nameplate/test currents are **line** values. The per-phase equivalent circuit works with
-**phase** currents, converted once up front:
+Nameplate/test currents are **line** values. Because the circuit is the
+wye-equivalent per-phase circuit, the per-phase current is the **line**
+current for both connections (the connection is already reflected in the
+circuit values via `Jconn`):
 
 ```
-        I_line              (Y / Wye connection)
-I_ph =
-        I_line / √3         (Δ/Delta connection)
+I_ph = I_line        (Y and Δ)
 ```
 
 Applied to `I_FL`, `I_LR`, and `I_0`:

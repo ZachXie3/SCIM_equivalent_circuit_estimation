@@ -45,6 +45,9 @@ class MotorCase:
     P_core: float | None = None
     T_ambient_C: float = 25.0
     temp_rise_C: float = 80.0
+    # Optional exact R2 (ground truth), bypassing estimate_r2_from_r3. Used by
+    # the Stage 5 "accurate R2/R3" experiment (plan §2.5).
+    R2_override: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -178,13 +181,19 @@ class EquivalentCircuitEstimator:
         raise ValueError(f'Unsupported connection: {self.case.connection!r}')
 
     def _per_phase_voltage(self) -> float:
-        # V_LL -> V_ph: V_LL/√3 (Y), V_LL (Δ).
-        if self._is_delta:
-            return self.case.V_LL
+        # Wye-equivalent per-phase voltage: V_LL/sqrt(3) for BOTH connections.
+        # The circuit values (R1, X1, ...) are the wye-equivalent per-phase
+        # circuit (delta-to-wye: Z_y = Z_d/3, already applied by Jconn in
+        # eq_calculator.py), so the per-phase voltage is always V_LL/sqrt(3).
+        # The connection only matters for validating the MotorCase.
+        self._is_delta
         return self.case.V_LL / math.sqrt(3.0)
 
     def _line_to_phase_current(self, i_line: float) -> float:
-        return i_line / math.sqrt(3.0) if self._is_delta else i_line
+        # Wye-equivalent per-phase current: the line current for BOTH
+        # connections (see _per_phase_voltage).
+        self._is_delta
+        return i_line
 
     def _correct_r1_to_hot(self) -> float:
         ta = self.case.T_ambient_C
@@ -299,17 +308,22 @@ class EquivalentCircuitEstimator:
 
         # R2 prior from the standalone dataset model. It is constant during
         # the outer loop for Models B/D, but is recomputed here so the loop
-        # stays generic if the model gains X1-dependent predictors.
-        r2_info = estimate_r2_from_r3(
-            self.R3, self.s_FL, self.case.P, self.case.P_out
-        )
-        if r2_info["out_of_range"]:
-            warnings.add("dataset_model_out_of_range")
-        if not r2_info["pole_match"]:
-            warnings.add("dataset_model_fallback_used")
-        R2 = r2_info["r2"]
-        if r2_info["clamped"]:
-            warnings.add("R2_greater_than_R3")
+        # stays generic if the model gains X1-dependent predictors. When an
+        # exact R2 is supplied (R2_override, plan §2.5 experiment), skip the
+        # empirical prior entirely.
+        if self.case.R2_override is not None:
+            R2 = max(min(self.case.R2_override, self.R3), 0.0) if self.R3 > 0.0 else 0.0
+        else:
+            r2_info = estimate_r2_from_r3(
+                self.R3, self.s_FL, self.case.P, self.case.P_out
+            )
+            if r2_info["out_of_range"]:
+                warnings.add("dataset_model_out_of_range")
+            if not r2_info["pole_match"]:
+                warnings.add("dataset_model_fallback_used")
+            R2 = r2_info["r2"]
+            if r2_info["clamped"]:
+                warnings.add("R2_greater_than_R3")
         if R2 <= 0.0 or self.R3 <= 0.0:
             warnings.add("negative_or_zero_parameter")
 

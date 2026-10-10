@@ -19,30 +19,51 @@ N_ROWS = 60
 
 @pytest.fixture(scope="module")
 def raw() -> pd.DataFrame:
-    return pd.read_csv(v.RESULTS_CSV).iloc[:N_ROWS]
+    df = v.valid_rows(pd.read_csv(v.RESULTS_CSV))
+    return df.iloc[:N_ROWS]
 
 
 def test_stage1_stage2_vector(raw):
     st = v.stage1_stage2(raw)
-    for key in ("v_ph", "i_fl_ph", "s_fl", "r1_hot", "r1_cold_feed"):
+    for key in ("v_ph", "i_fl_ph", "s_fl", "r1_hot", "r1_cold_feed",
+                "pf_fl", "i_lr_line", "p_0", "t_lr_pu"):
         assert len(st[key]) == N_ROWS
         assert np.all(np.isfinite(st[key]))
     assert np.all(st["r1_hot"] > 0)
     assert np.all(st["r1_hot"] > st["r1_cold_feed"])
+    assert np.all((st["pf_fl"] > 0) & (st["pf_fl"] <= 1.0))
 
 
-def test_r2_prior_series_bounds(raw):
+def test_valid_rows_filters():
+    df = pd.read_csv(v.RESULTS_CSV)
+    out = v.valid_rows(df)
+    assert len(out) < len(df)
+    slip = (out["SRPM"] - out["RPM"]) / out["SRPM"]
+    assert (slip > 0).all()
+    assert ((out["R2"] / out["R3"]) < 1.0).all()
+
+
+def test_r2_prior_series_modes(raw):
     d = v._build_dyn(raw)
-    d = v.r2_prior_series(d)
+    v.r2_prior_series(d, "ground-truth")
     r2 = d["r2_prior"].to_numpy()
+    expected = np.minimum(d["r2_gt"].to_numpy(), d["r3_est"].to_numpy())
+    assert np.allclose(r2, expected)
     assert np.all(r2 > 0)
     assert np.all(r2 <= d["r3_est"].to_numpy())
 
+    d2 = v._build_dyn(raw)
+    v.r2_prior_series(d2, "prior")
+    r2 = d2["r2_prior"].to_numpy()
+    assert np.all(r2 > 0)
+    assert np.all(r2 <= d2["r3_est"].to_numpy())
 
+
+@pytest.mark.parametrize("mode", ["prior", "ground-truth"])
 @pytest.mark.parametrize("x1frac,x2frac", [(0.02, 0.02), (0.15, 0.15)])
-def test_solver_finite(raw, x1frac, x2frac):
+def test_solver_finite(raw, mode, x1frac, x2frac):
     dyn = v._build_dyn(raw)
-    dyn = v.r2_prior_series(dyn)
+    v.r2_prior_series(dyn, mode)
     sol = v.solve_x1x2_vector(dyn, dyn["x0"].to_numpy(), max_iter=5)
     assert np.all(np.isfinite(sol["X1"]))
     assert np.all(np.isfinite(sol["X2"]))
@@ -50,16 +71,18 @@ def test_solver_finite(raw, x1frac, x2frac):
     assert np.all(sol["X2"] >= 0)
 
 
-def test_pipeline_roundtrip_converges(raw):
-    res = v.run_vectorised(raw)
+@pytest.mark.parametrize("mode", ["prior", "ground-truth"])
+def test_pipeline_roundtrip_converges(raw, mode):
+    res = v.run_vectorised(raw, mode)
     assert len(res) == N_ROWS
     assert res["converged"].mean() > 0.9
     for c in ("R2", "R3", "X1", "X2", "X3", "Xm", "design_id"):
         assert c in res.columns
 
 
-def test_compute_errors_columns(raw):
-    res = v.run_vectorised(raw)
+@pytest.mark.parametrize("mode", ["prior", "ground-truth"])
+def test_compute_errors_columns(raw, mode):
+    res = v.run_vectorised(raw, mode)
     err = v.compute_errors(res, raw)
     for p in v.METRIC_PARAMS:
         assert f"err_{p}" in err.columns
@@ -67,8 +90,8 @@ def test_compute_errors_columns(raw):
 
 
 def test_ref_table_matches_reference(raw):
-    res = v.run_vectorised(raw)
-    ref, _ = v.run_reference(raw, np.arange(min(5, len(raw))))
+    res = v.run_vectorised(raw, "ground-truth")
+    ref, _ = v.run_reference(raw, np.arange(min(5, len(raw))), "ground-truth")
     ref_ok = [r for r in ref if not r.get("raised")]
     assert len(ref_ok) > 0
     tbl = v._ref_table(ref_ok, res)
@@ -78,3 +101,4 @@ def test_ref_table_matches_reference(raw):
 
 def test_module_imports():
     assert v.METRIC_PARAMS == ("R2", "R3", "X1", "X2", "X3", "Xm")
+    assert v.MODES == ("prior", "ground-truth")

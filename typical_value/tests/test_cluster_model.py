@@ -42,7 +42,7 @@ def df():
 
 def test_prepare_drops_invalid_rows():
     df = cm.prepare(pd.read_csv(DATA_CSV))
-    assert len(df) == 3853
+    assert len(df) == 3865
     assert (df["slip"] > 0).all()
     assert (df["ratio"] < RATIO_MAX).all()
     assert df["y"].isna().sum() == 0

@@ -81,7 +81,7 @@ The detailed formulas live in `spec/equivalent_circuit_estimation.md` (Part A). 
 
 ---
 
-## Stage 2 — Estimate R2 from R3 (dataset-driven empirical relationship)
+## Stage 2 — R2 from R3, and the circuit-solve question
 
 ### 2.1 Engineering intent
 
@@ -168,87 +168,116 @@ R3 >= R2 > 0
 
 If the calculated `R2` violates these expectations, flag the case and fall back to engineering review, not silent correction.
 
-### 2.4 Dataset-driven R2/R3 model (R2 prior) — THE IMPLEMENTATION
+### 2.4 R2/R3 estimation methods considered (the problem, tabled)
 
-The historical dataset (`typical_value/data/eq_parameters.csv`, see Stage 5) provides the empirical `R2/R3` relationship used to derive
-R2 from R3; it seeds the solver or acts as a soft constraint.
+The running/standstill rotor-resistance ratio `R2/R3` is the input to the
+Stages 3-4 solve: `R2 = ratio * R3` (§2.1). The exact skin-effect formula is
+infeasible from nameplate data (§2.2), so the ratio has been modelled
+empirically. Methods implemented so far:
 
-Candidate models (power-law in log-log space), scored by MAE / RMSE / P10-P50-P90 of
-predicted vs dataset R2:
+| Method | Inputs | Form | Implementation | R2 test RMSE |
+|---|---|---|---|---|
+| A — constant | — | `R2/R3 = c` | `r2r3/models.py` | ~72% |
+| B — slip power law | `s_fl` | `c * s^a` | `r2r3/models.py` | ~33% |
+| C — per-pole slip law | `s_fl`, poles | per-pole `c * s^a` | `r2r3/models.py` | ~36% |
+| D — per-pole slip+HP | `s_fl`, poles, HP | per-pole `c * s^a * HP^b` | `r2r3/models.py` | ~26% |
+| slip+HP global law | `s_fl`, HP | `7.1 * s^0.57 / HP^0.12` | `r2r3/report.py` §11 | ~27% |
+| slip-segment table | `s_fl` | constant per slip band | `r2r3/constant_bin.py` | ~32% |
+| cluster — unweighted | 7 features | K-means lookup | `typical_value/cluster/` | ~32% |
+| cluster — weighted | 7 features | NN-weighted K-means lookup | `typical_value/cluster/` | ~26% |
+
+The three methods named for the current study are the **slip-segment table**,
+the **slip+HP function**, and **clustering (unweighted / weighted)**. The best
+achievable `R2/R3` prior error is ≈ 26% (relative RMSE on R2).
+
+> Numbers are indicative: the power-law / table rows are in-sample from
+> `reports/r2r3_report.md` (§4, §11); the cluster rows are held-out test from
+> `reports/cluster_report.md`. The factor review that shaped the nameplate-only
+> choices is in §2.7; the cluster analysis is documented in `cluster-plan.md`.
+
+The `R2/R3` prior error is **one** of two independent error sources in the
+estimator (see §2.5).
+
+### 2.5 The fundamental question — is the circuit solve adequate?
+
+The estimator's total error has two independent sources:
+
+1. **`R2/R3` prior error** — feature-driven (the methods in §2.4; best ≈ 26%).
+2. **Circuit-solve error** — given an accurate ratio, how well do the Stages 3-4
+   equations recover `X1`, `X2`, `X3`, `Xm` (and `R2`/`R3` themselves) from the
+   nameplate and test inputs?
+
+**Question:** if we have an accurate `R2/R3`, with the current calculation
+procedure in this plan, is it enough to calculate the equivalent circuit close
+enough to ground truth?
+
+**Experiment (the immediate next step):** decouple the two error sources by
+feeding the estimator the **ground-truth `R2/R3` ratio for each record**,
+bypassing the empirical prior:
+
+- use only rows with `R2/R3 < 1` (a ratio ≥ 1 violates the physics bound
+  `R2 <= R3` and is excluded);
+- set `R2 = ratio_gt * R3` (equivalently, use the dataset `R2` column directly)
+  and run the full Stages 1-4 pipeline;
+- compare the estimated `X1`, `X2`, `X3`, `Xm`, `R3` against the dataset ground
+  truth;
+- aggregate relative errors (MAE / RMSE / P10-P90) per parameter and by subgroup
+  (pole count, voltage class, HP bucket, connection).
+
+Outcome decides where to focus next:
+
+- small solve errors → the procedure is adequate; invest in the `R2/R3` prior.
+- large solve errors → rework the Stage 3/4 solver first.
+
+This experiment is run through the Stage 5 harness (§5).
+
+#### 2.5.1 Findings from the first ground-truth run
+
+First run of the experiment (ground-truth `R2`, real measurements, valid rows
+only) — details in `reports/validation_report.md`:
+
+- **`Xm` is recovered well** — ~3% RMSE (both connections).
+- **`R2`** is recovered exactly where the physical clamp `R2 <= R3` does not
+  bind (delta ~2% RMSE); wye is worse (~16%) because the real `R3` back-solve
+  (from `T_LR = LockedRotorTorque/100`) occasionally undershoots and clamps R2.
+- **`R3`** carries real measurement error (~12% median, RMSE ~31-52%) — the
+  catalog `LockedRotorTorque` spec vs the design value, not a solver issue.
+- **`X1`/`X2` are not identifiable** from the full-load terminal measurements:
+  the solver pushes `X1` toward ~0 and lets `X2` absorb the total leakage
+  (delta `X1` median −100%, `X2` +100%; wye `X1` +19%, `X2` +52%).
+
+Diagnostic at the **true** `(X1, X2)`: the residuals are *not* zero —
 
 ```text
-Model A:
-R2/R3 = constant
-
-Model B:
-R2/R3 = f(s_fl)
-
-Model C:
-R2/R3 = f(s_fl, pole_count)
-
-Model D:
-R2/R3 = f(s_fl, pole_count, HorsePower)
+r1 (current, real)  ~ −0.8%     nameplate Amps vs the design circuit
+r2 (current, imag)  ~ +5.8%     nameplate PowerFactor100 vs the design circuit
+r3 (torque)         ~ +10%      same + solver-formula issues (below)
 ```
 
-For each model:
+The nameplate `Amps` / `PowerFactor100` are catalog values that differ from the
+exact design circuit by ~4-10%; because the `X1`/`X2` split is ill-conditioned,
+this small inconsistency is amplified into large `X1`/`X2` errors.
 
-```text
-Predict R2
-Compare predicted R2 to dataset R2
-Compute MAE, RMSE, and P10/P50/P90 error bands
-```
+**Solver-formula issues found (in addition to the identifiability):**
 
-Select the simplest model that captures most of the available accuracy.
+1. The torque residual computes the rotor current from the **measured** phasor
+   `I2 = I_FL_vec * Zm/(Zm+Z2)` while the current residuals use the **predicted**
+   phasor `I_pred = V/Z_fl` — two different circuit states in one objective.
+2. The torque factor `(1−s)/s` computes `P_conv/ω_s` = shaft torque × `(1−s)`;
+   it should be `1/s` (air-gap torque `3*I2²*R2/(s*ω_s)`).
 
-Engineering expectation (validated against the dataset):
+A prototype with both fixes (same solver, ground-truth mode) improved recovery:
+`X2` RMSE 3.36 → 1.06, `X1` median −0.68 → −0.15. See §5.6 for the full
+correction plan.
 
-```text
-Slip is likely the strongest predictor.
-Pole count is likely the second strongest predictor.
-Horsepower may provide smaller incremental improvement.
-```
+#### 2.5.2 Conclusion
 
-### 2.5 Decision (tentative) — adopt Model D
-
-Analysis on the 4,180-row dataset (`typical_value/reports/r2r3_report.md`, `§4`) supports Model D:
-
-| Model | Predictors | RMSE (%) |
-|---|---|---|
-| A | constant | 71.8 |
-| B | `s_fl` | 32.8 |
-| C | `s_fl`, pole count | 36.4 |
-| **D (selected)** | `s_fl`, pole count, HP | **26.0** |
-
-Fitted power law (log-log fit, per pole count):
-
-```
-R2/R3 = exp(b) * s_fl^a * HP^c
-R2 = R3 * exp(b) * s_fl^a * HP^c
-```
-
-Coefficients (see `typical_value/reports/r2r3_report.md` §5):
-
-| Poles | a | c | b |
-|---|---|---|---|
-| 2 | 0.744 | -0.050 | 2.464 |
-| 4 | 0.634 | -0.129 | 2.277 |
-| 6 | 0.466 | -0.154 | 1.629 |
-| 8 | 0.452 | -0.123 | 1.393 |
-
-**Status: tentative.** In-sample only; validate with a train/test split and against the
-outcome of Stage 3 (X1, X2 solver) before finalising. R3 / R2 priors and bandwidths are
-consumed by Stage 2.6.
-
-Note: efficiency-band and enclosure splittings were dropped by review — enclosure has no
-dependable nameplate proxy, and efficiency band is a messy metric. A grouping-constant
-alternative (voltage / pole / HP bucket / slip bin tables) was scored and saved in the
-report §6; it does not beat Model D.
-
-Whatever model is chosen, it must respect the same physical bounds as §2.3:
-
-```text
-R3 >= R2 > 0
-```
+The current Stages 3-4 procedure is **adequate for `Xm`, `R2`, `R3`** but
+**not for the `X1`/`X2` split**. Two distinct problems must be addressed before
+the `R2/R3` prior becomes the limiting factor: (a) two solver-formula
+inconsistencies (§5.6), and (b) the fundamental `X1`/`X2` identifiability,
+which needs an additional constraint (leakage-split prior from the locked-rotor
+data).
 
 ### 2.6 Long-term estimator architecture
 
@@ -260,6 +289,13 @@ Dataset analysis
     -> prior estimate bandwidth
     -> circuit solver refinement
 ```
+
+**Prior candidates for the estimator** (production, when the true ratio is
+unavailable): any of the §2.4 methods — Model D
+(`R2/R3 = exp(b) * s_fl^a * HP^c` per pole; coefficients in
+`reports/r2r3_report.md` §5), the global slip+HP law, or the weighted-cluster
+lookup. The §2.5 experiment establishes the solver's accuracy when the prior is
+exact — the ceiling any prior-based estimate can reach.
 
 Recommended future solver variables:
 
@@ -377,6 +413,13 @@ Overall RMSE ≈ 34%, MAE ≈ 26% (n = 4192). Roughly as accurate as the slip-on
 power law; ~7 pp behind the continuous slip+HP formula. `reports/r2r3_report.md` §11.1
 carries per-bin P10–P90 bands.
 
+**Later addition — clustering methods** (`typical_value/cluster/`, see
+`cluster-plan.md`): a K-means-style lookup over the seven nameplate features,
+optionally with NN-learned per-feature weights and a feature-count penalty. The
+unweighted version matches the slip-segment table (~32% held-out test RMSE);
+the weighted version reaches ~26%, comparable to Model D, while still producing
+a hand-applicable lookup table.
+
 ---
 
 ## Stage 3 — Solve X1 and X2 from full-load equations
@@ -427,19 +470,19 @@ res_I_imag = imag(I_pred - I_fl_vector)
 For the same candidate `(X1, X2)`, calculate rotor current using current division:
 
 ```text
-I_2_vector = I_fl_vector / (j*Xm + R2/s_fl + j*X2) * (j*Xm)
+I_2_vector = I_pred / (j*Xm + R2/s_fl + j*X2) * (j*Xm)
 ```
 
 Equivalent form using branch impedances:
 
 ```text
-I_2_vector = I_fl_vector * Z_m / (Z_m + Z_2)
+I_2_vector = I_pred * Z_m / (Z_m + Z_2)
 ```
 
 Full-load electromagnetic/mechanical output torque target:
 
 ```text
-T_fl_calc = (3 * abs(I_2_vector)^2 * ((1 - s_fl)/s_fl) * R2) / w_s
+T_fl_calc = (3 * abs(I_2_vector)^2 * (1/s_fl) * R2) / w_s
 ```
 
 Match this against the known full-load shaft torque:
@@ -447,6 +490,13 @@ Match this against the known full-load shaft torque:
 ```text
 T_FL = P_out_hp * 745.7 / w_fl
 ```
+
+> **Correction note (§5.6):** the equations above are the *corrected* target —
+> rotor current from the predicted phasor `I_pred` (one consistent circuit
+> state for all residuals) and the air-gap torque factor `1/s` (not `(1−s)/s`).
+> The current implementation in `equivalent_circuit.py` still uses the
+> measured phasor `I_FL_vector` and `(1−s)/s`; it is pending the §5.6 solver
+> correction.
 
 ### 3.4 Nonlinear solve target
 
@@ -579,10 +629,12 @@ These are diagnostic values only. They shall not be used as alpha-based constrai
 
 ### 5.1 Objective
 
-`typical_value/data/eq_parameters.csv` (4,195 rows) carries two kinds of information:
+`typical_value/data/eq_parameters.csv` (4,206 rows) carries two kinds of information:
 
-1. **Nameplate / design inputs** the estimator is allowed to consume (voltage, frequency,
-   poles, speed, HP, amps, no-load amps, connection, winding resistance at 105 °C), plus
+1. **Nameplate / design inputs and test measurements** the estimator is allowed to
+   consume (voltage, frequency, poles, speed, HP, amps, no-load amps, connection,
+   winding resistance at 105 °C, power factor, locked-rotor current and torque,
+   no-load power), plus
 2. **ground-truth per-phase circuit parameters** (`R1`, `R2`, `R3`, `X1`, `X2`, `X3`, `Xm`)
    computed by the same design-tool calculator (`typical_value/eq_calculator.py`).
 
@@ -590,32 +642,43 @@ This stage runs the Stages 1-4 pipeline over every row, compares the predicted p
 circuit against the ground-truth columns, and reports where the estimator is close and where
 it is systematically wrong.
 
+**Row filter:** only rows with `R2/R3 < 1` are used. A ratio ≥ 1 (338 rows) violates the
+physics bound `R2 <= R3` and is not valid data.
+
 ### 5.2 Allowable inputs and what the dataset holds
 
 The estimator may only consume the `MotorCase` fields listed in
-`spec/equivalent_circuit_estimation.md` ("Input data"). Mapping:
+`spec/equivalent_circuit_estimation.md` ("Input data"). The dataset now carries
+**all** of them as measured columns; only `R1_cold` and `T_LR` need conversion:
 
-| `MotorCase` field | name | dataset column | present? |
+| `MotorCase` field | unit | dataset column | how supplied |
 |---|---|---|---|
-| `V_LL` | | `Voltage` | yes |
-| `f` | Hz | `Frequency` | yes |
-| `P` (poles) | | `PoleSpeed` | yes |
-| `n_FL` | RPM | `RPM` | yes |
-| `P_out` | HP | `HorsePower` | yes |
-| `I_FL` | A | `Amps` | yes |
-| `I_0` | A | `NoLoadAmps` | yes |
-| `connection` | Wye/Delta | `Connection` | yes |
+| `V_LL` | V | `Voltage` | as-is |
+| `f` | Hz | `Frequency` | as-is |
+| `P` (poles) | | `PoleSpeed` | as-is |
+| `n_FL` | RPM | `RPM` | as-is |
+| `P_out` | hp | `HorsePower` | as-is |
+| `I_FL` | A | `Amps` | as-is |
+| `I_0` | A | `NoLoadAmps` | as-is |
+| `connection` | Wye/Delta | `Connection` | as-is |
 | `R1_cold` | Ω | reverse-corrected `WindingResistAt105` | derived (§5.2.1) |
-| `PF_FL` | — | — | no → synthetic (§5.2.2) |
-| `I_LR`, `T_LR`, `T_BD` | — | — | no → synthetic |
-| `P_0`, `P_FW`, `P_core` | — | — | no → synthetic / default |
-| `J` (inertia) | — | — | not needed by Stages 3-4 |
+| `PF_FL` | — | `PowerFactor100` | as-is (fraction) |
+| `I_LR` | A | `LockedRotorAmps` | as-is |
+| `T_LR` | pu of `T_FL` | `LockedRotorTorque` | % of full-load torque → /100 |
+| `P_0` | W | `NoLoadWatts` | as-is (3-phase watts) |
+
+Fields **not** consumed by the algorithm, so not listed as inputs:
+
+- `BreakDownTorque` (`T_BD`) — not used by Stages 1-4.
+- `P_FW`, `P_core`, `J` (inertia) — not used by Stages 1-4.
 
 #### 5.2.1 Stator resistance from the 105 °C value
 
-`WindingResistAt105` is `R1` at 105 °C. The estimator computes `R1_hot` from `R1_cold` using
-`T_ambient_C + temp_rise_C` (defaults `25 °C` + `80 °C` = 105 °C). So feed an ambient value
-that reproduces the 105 °C figure with those defaults:
+`WindingResistAt105` **is** `R1` at 105 °C — the dataset gives the hot stator
+phase resistance directly (per-phase after the `Jconn` conversion). In
+production only `R1_cold` (ambient) is known. The estimator computes `R1_hot`
+from `R1_cold` using `T_ambient_C + temp_rise_C` (defaults `25 °C` + `80 °C` =
+105 °C), so feed the reverse-corrected ambient value:
 
 ```text
 R1_cold = R1_dataset_105 ∘C * (T_ambient_C + K1_COPPER) / (T_ambient_C + temp_rise_C + K1_COPPER)
@@ -624,25 +687,35 @@ R1_cold = R1_dataset_105 ∘C * (T_ambient_C + K1_COPPER) / (T_ambient_C + temp_
 i.e. `R1_cold = R1_dataset_105 ∘C * (25 + 234.5) / (105 + 234.5)`. This keeps the estimator's
 temperature path unchanged (defaults intact) and makes `R1_hot` match the dataset's `R1` column.
 
-#### 5.2.2 Synthetic test inputs (forward simulation of ground truth)
+#### 5.2.2 Torque conversion and the test-measurement columns
 
-The file has no `PF_FL`, `I_LR`, `T_LR`, `T_BD`, or no-load power. For a defensible
-"recover known circuit" comparison, generate these as though they were measured on the
-*known* motor: a perfect-instrument measurement of the ground-truth circuit:
+No synthetic forward simulation is needed anymore — `PF_FL`, `I_LR`, `P_0`, and
+`T_LR` are all measured columns (`PowerFactor100`, `LockedRotorAmps`,
+`NoLoadWatts`, `LockedRotorTorque`). `LockedRotorTorque` is a **percentage of
+full-load torque**, so:
 
 ```text
-full-load :  s = s_FL(nameplate); Z_fl = R1_hot + jX1 + (jXm // (R2/s + jX2))
-             I_FL stays the dataset Amps; PF_FL = cos(angle(Z_fl))
-locked-rot:  I_LR   = V_ph / |R1_cold + R3 + j(X1 + X3)|
-             T_LR   = [ 3 * I_LR² * R3 / ω_s ] / T_FL       (pu)
-no-load  :  I_0    = |V_ph / (R1_hot + j(X1 + Xm))|
-             P_0    = 3 · Re(V_ph · conj(I_0))
+T_LR   = LockedRotorTorque / 100            (pu of T_FL)
 ```
 
-Then call `estimate_r2_from_r3` (Stage 2) and the Stage 3/4 solve as normal. Note that with
-this construction the estimator's Stage-1 back-solves (`R3`, `XLR`, `X0`) become near-exact
-by construction; the genuinely informative comparison is `R2` (dataset prior), `X1`, `X2`,
-and the derived `Xm`, `X3`.
+(Equivalently: `T_FL = P_out * 745.7 / omega_fl` in N·m, then
+`T_LR_abs = (LockedRotorTorque / 100) * T_FL`; the `T_FL` factor cancels in
+the `R3` back-solve.) The `R3` back-solve is therefore a **real measurement**
+(catalog spec vs design value, ~12% median), not a synthetic/exact value.
+
+Then call the Stage 3/4 solve as normal. Two run modes:
+
+- **Prior mode** (production view): `R2 = estimate_r2_from_r3(...)` — the
+  empirical prior from §2.4; the `R2/R3` prior error is included.
+- **Ground-truth mode** (the §2.5 experiment): `R2 = ratio_gt * R3` — bypass the
+  prior entirely to isolate the circuit-solve error.
+
+Per-phase convention (see `equivalent_circuit_estimation.md` §A1): the circuit
+values are the wye-equivalent per-phase circuit (delta-to-wye `Z_y = Z_d/3`
+via `Jconn` in `eq_calculator.py`), so `V_ph = V_LL/sqrt(3)` and
+`I_ph = I_line` for **both** connections. Using `V_ph = V_LL` for delta (the
+former convention) makes the delta circuit draw ~3x the nameplate current and
+must not be used.
 
 ### 5.3 Comparison metrics
 
@@ -654,11 +727,11 @@ err_pct(p) = 100 * (p_est - p_gt) / p_gt      for p in R2, R3, X1, X2, X3, Xm
 
 Validated parameters are only those with a dataset counterpart: the file carries ground-truth
 `R1, R2, R3, X1, X2, X3, Xm` columns. `R1` is excluded because it is a direct input to the
-estimation (a simple, user-measurable resistance) rather than a recovered quantity; it is also
-what the synthetic construction of §5.2.2 reproduces essentially exactly. `X0` and `XLR`
-have no ground-truth column and are back-solves of the input data, so they are not part of
-the error metric either.
+estimation (a simple, user-measurable resistance) rather than a recovered quantity. `X0` and
+`XLR` have no ground-truth column and are back-solves of the input data, so they are not part
+of the error metric either.
 
+Run on the **valid subset only** (§5.1): rows with `R2/R3 < 1` and `slip > 0`.
 Aggregate on converged rows only:
 
 - MAE (%), RMSE (%), median, and P10 / P90 per parameter
@@ -667,11 +740,18 @@ Aggregate on converged rows only:
 - cross-tables by pole count / voltage class / HP bucket / efficiency band / connection
 - worst-outlier rows per parameter, for engineering review
 
+Report the metrics for **both run modes** (§5.2.2):
+
+- prior mode — the empirical `R2/R3` prior (production view; prior error included);
+- ground-truth mode — `R2 = ratio_gt * R3` (§2.5 experiment; isolates the
+  circuit-solve error). The ground-truth-mode errors are the headline answer to
+  the §2.5 question.
+
 Metrics are purely diagnostic; they only sanity-check %-error budgets.
 
 ### 5.4 Matrix-driven batch execution (no per-row Python loop)
 
-With 4,183 rows the per-row estimator loop is slow. Plan a vectorised pipeline:
+With 4,206 rows the per-row estimator loop is slow. Plan a vectorised pipeline:
 
 ```text
 Stage 1 + Stage 2 (closed form)   → numpy reduces over the whole table (no loop)
@@ -703,7 +783,56 @@ The validation harness must:
 - recommended warning bands for the estimator, seeded from the observed spread of the
   parameter errors in §5.3 and consumed by Stage 2.6
 
-Not started — this is the next implementation stage.
+Status: **implemented.** The harness (a) consumes the real measurement columns
+(`PowerFactor100`, `LockedRotorAmps`, `NoLoadWatts`, `NoLoadAmps`,
+`WindingResistAt105`, `LockedRotorTorque`) instead of synthetic inputs,
+(b) applies the `R2/R3 < 1` filter, and (c) runs both `prior` and
+`ground-truth` `R2/R3` modes. The §2.5 experiment is the ground-truth mode.
+Findings are summarised in §2.5.1; the solver correction plan is §5.6.
+
+Key points:
+
+- `Xm` recovered ~3% RMSE; `R2` recovered except where the `R2 <= R3` clamp
+  binds; `R3` carries real measurement error (`T_LR = LockedRotorTorque/100`).
+- `X1`/`X2` are **not identifiable** from full-load terminal measurements alone
+  — amplified by a small nameplate-vs-design inconsistency and two solver-formula
+  issues (§5.6).
+- **Per-phase convention resolved**: the circuit values are the wye-equivalent
+  per-phase circuit (`Jconn = 3` for delta is correct), so `V_ph = V_LL/sqrt(3)`
+  and `I_ph = I_line` for both connections. The former `V_ph = V_LL` for delta
+  made the delta circuit imply ~3x the nameplate current — fixed in
+  `equivalent_circuit.py` (§A1). Both connections are now internally consistent
+  (`I_implied / I_nameplate` ≈ 0.96).
+
+Open items carried forward: `BreakDownTorque` units (not used by the
+algorithm); whether the residual `X1`/`X2` error is acceptable after §5.6.
+
+### 5.6 Solver correction plan
+
+The ground-truth experiment (§2.5.1) shows two solver-formula issues plus a
+fundamental identifiability problem. Correct in this order:
+
+1. **Consistent phasor state for the torque residual** — compute the rotor
+   current from the **predicted** current `I_pred = V/Z_fl` (same circuit state
+   as the current residuals), not from the measured `I_FL_vec`:
+   `I2 = I_pred * Zm / (Zm + Z2)`. One consistent state for all three residuals.
+2. **Torque factor** — use the air-gap torque `3*|I2|^2 * R2 / (s * omega_s)`
+   (factor `1/s`), replacing `(1−s)/s` which computes `P_conv/omega_s` = shaft
+   torque × `(1−s)`.
+3. **Identifiability of the `X1`/`X2` split** — the total leakage is well
+   determined but the split is not. Options (evaluate after 1-2):
+   - add a **leakage-split soft prior** anchored by the locked-rotor data:
+     `XLR = X1 + X3` is measured, and the design provides both `X2` and `X3`, so
+     a prior on the rotor-leakage ratio `X2/X3` (skin-effect relation) or
+     `X1/X2` separates the split;
+   - **reparameterise** the solve as `(X1, Xtot)` or `(X1, X1/X2)` instead of
+     `(X1, X2)`;
+   - use **weighted / polar residuals** (`|I|`, angle) so catalog-`PF` noise
+     (±~0.03) does not dominate the reactive residual.
+
+Prototype result with fixes 1-2 (same solver, ground-truth mode): `X2` RMSE
+3.36 → 1.06, `X1` median −0.68 → −0.15. Fixes 1-2 are the next implementation
+step; fix 3 is the follow-up.
 
 ---
 

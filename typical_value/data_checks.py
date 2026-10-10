@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-EXPECTED_NUM_ROWS = 4195
+EXPECTED_NUM_ROWS = 4206
 
 INPUT_COLUMNS = [
     "RatingID",
@@ -43,6 +43,7 @@ INPUT_COLUMNS = [
     "RPM",
     "Amps",
     "NoLoadAmps",
+    "NoLoadWatts",
     "LockedRotorAmps",
     "LockedRotorTorque",
     "BreakDownTorque",
